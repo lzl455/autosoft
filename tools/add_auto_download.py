@@ -19,6 +19,9 @@
    触发条件：复选框已勾选 且 已选择烧录文件。
 3. 包住“跳转APP”函数(0x404290)：跳转成功时记下时间戳。刚烧完的设备在
    SKIP_WINDOW_MS 内重新枚举回来时不再触发，避免同一只设备被反复烧录。
+4. 记住勾选状态：保存在注册表 HKCU\\Software\\BYC\\BootLoader_Tools 的
+   AutoDownload (DWORD) 里。点击复选框时立即写入（挂在对话框 WindowProc 转给
+   基类的那个 call 上），OnInitDialog 里打开设备之前读回并设置复选框。
 
 原程序里与本补丁有关的内容（逆向所得）
     0x56E0A4  DWORD 状态机: 0 空闲 / 3 等待进BOOT后下载 / 6 等待进BOOT后读取
@@ -29,6 +32,9 @@
     0x4043D0  读取设备信息 (esi = this)
     0x4049C0  “下载程序”按钮处理函数 (ecx = this)
     0x404290  跳转 APP (esi = this)，成功时把状态置 2
+    0x4024D0  查找并打开设备 (edi = this)，OnInitDialog 在 0x40223A 调用
+    0x4068DB  基类 WindowProc (ecx = this; msg, wParam, lParam)，
+              对话框自己的 WindowProc(0x4025A0, edi = this) 在 0x402611 调用
 """
 import hashlib
 import os
@@ -50,9 +56,17 @@ FILE_ALIGN = 0x200
 FN_GET_INFO = 0x4043D0
 FN_ON_DOWNLOAD = 0x4049C0
 FN_JUMP_APP = 0x404290
+FN_OPEN_DEVICE = 0x4024D0
+FN_BASE_WNDPROC = 0x4068DB
 G_STATE = 0x56E0A4
 IAT_SendDlgItemMessageW = 0x51E6CC
 IAT_GetTickCount = 0x51E374
+IAT_CheckDlgButton = 0x51E6C8
+IAT_RegQueryValueExW = 0x51E000
+IAT_RegOpenKeyExW = 0x51E004
+IAT_RegCreateKeyExW = 0x51E008
+IAT_RegSetValueExW = 0x51E00C
+IAT_RegCloseKey = 0x51E020
 
 # 被改写的 call 指令（均为 E8 rel32，不带重定位）: 地址 -> (原目标, 新目标标号)
 CALL_SITES = {
@@ -60,6 +74,8 @@ CALL_SITES = {
     0x402446: (FN_GET_INFO, 'hook_app'),    # 正常模式接入分支
     0x404212: (FN_JUMP_APP, 'hook_jump'),   # 读取程序成功后跳转 APP
     0x404B6C: (FN_JUMP_APP, 'hook_jump'),   # 下载程序成功后跳转 APP
+    0x40223A: (FN_OPEN_DEVICE, 'hook_init'),        # OnInitDialog: 首次打开设备之前
+    0x402611: (FN_BASE_WNDPROC, 'hook_wndproc'),    # WindowProc: 转给基类之前
 }
 
 # ---- 新增内容 --------------------------------------------------------------
@@ -69,6 +85,8 @@ CHK_TEXT = '自动下载模式（设备接入后自动开始下载）'
 CHK_RECT = (6, 141, 230, 12)          # x, y, cx, cy (DLU)
 DLG_NEW_CY = 158                      # 原 142
 SKIP_WINDOW_MS = 15000
+REG_KEY = r'Software\BYC\BootLoader_Tools'    # 在 HKEY_CURRENT_USER 下
+REG_VALUE = 'AutoDownload'
 
 STUB_ASM = r'''
 bits 32
@@ -148,6 +166,112 @@ auto_ready:
 .no:
     xor     eax, eax
     ret
+
+; ---- OnInitDialog: 替换 0x40223A 处的 call 打开设备 (edi = this) ----
+hook_init:
+    call    load_state
+    push    eax
+    push    CHK_ID
+    push    dword [edi + 0x20]
+    call    [IAT_CheckDlgButton]
+    jmp     FN_OPEN_DEVICE
+
+; ---- WindowProc: 替换 0x402611 处转给基类的 call ----
+; ecx = edi = this, [esp+4] = msg, [esp+8] = wParam, [esp+12] = lParam
+hook_wndproc:
+    cmp     dword [esp + 4], 0x111      ; WM_COMMAND
+    jne     .pass
+    cmp     dword [esp + 8], CHK_ID     ; 复选框的 BN_CLICKED (通知码 0)
+    jne     .pass
+    call    save_state
+.pass:
+    jmp     FN_BASE_WNDPROC
+
+; ---- eax = 注册表里保存的勾选状态 (0/1)，读不到按 0 ----
+load_state:
+    push    ebp
+    mov     ebp, esp
+    sub     esp, 12                     ; [ebp-4] hkey, [ebp-8] 值, [ebp-12] 长度
+    and     dword [ebp - 8], 0
+    lea     eax, [ebp - 4]
+    push    eax                         ; phkResult
+    push    1                           ; KEY_QUERY_VALUE
+    push    0
+    push    str_key
+    push    0x80000001                  ; HKEY_CURRENT_USER
+    call    [IAT_RegOpenKeyExW]
+    test    eax, eax
+    jnz     .done
+    mov     dword [ebp - 12], 4
+    lea     eax, [ebp - 12]
+    push    eax                         ; lpcbData
+    lea     eax, [ebp - 8]
+    push    eax                         ; lpData
+    push    0                           ; lpType
+    push    0
+    push    str_value
+    push    dword [ebp - 4]
+    call    [IAT_RegQueryValueExW]
+    test    eax, eax
+    jz      .close
+    and     dword [ebp - 8], 0
+.close:
+    push    dword [ebp - 4]
+    call    [IAT_RegCloseKey]
+.done:
+    xor     eax, eax
+    cmp     dword [ebp - 8], 0
+    setne   al
+    leave
+    ret
+
+; ---- 把复选框当前状态写入注册表 (edi = this)，保持 ecx 不变 ----
+save_state:
+    push    ebp
+    mov     ebp, esp
+    sub     esp, 8                      ; [ebp-4] hkey, [ebp-8] 值
+    push    ecx
+    push    0
+    push    0
+    push    0xF0                        ; BM_GETCHECK
+    push    CHK_ID
+    push    dword [edi + 0x20]
+    call    [IAT_SendDlgItemMessageW]
+    and     eax, 1
+    mov     [ebp - 8], eax
+    push    0                           ; lpdwDisposition
+    lea     eax, [ebp - 4]
+    push    eax                         ; phkResult
+    push    0                           ; lpSecurityAttributes
+    push    2                           ; KEY_SET_VALUE
+    push    0                           ; dwOptions
+    push    0                           ; lpClass
+    push    0
+    push    str_key
+    push    0x80000001                  ; HKEY_CURRENT_USER
+    call    [IAT_RegCreateKeyExW]
+    test    eax, eax
+    jnz     .done
+    push    4
+    lea     eax, [ebp - 8]
+    push    eax
+    push    4                           ; REG_DWORD
+    push    0
+    push    str_value
+    push    dword [ebp - 4]
+    call    [IAT_RegSetValueExW]
+    push    dword [ebp - 4]
+    call    [IAT_RegCloseKey]
+.done:
+    pop     ecx
+    leave
+    ret
+
+; ---- 只读数据（紧跟在代码后面）----
+    align   4, db 0xCC
+stub_data:
+str_key:    dw REG_KEY_CHARS, 0
+str_value:  dw REG_VALUE_CHARS, 0
 '''
 
 
@@ -157,20 +281,17 @@ def align(v, a):
 
 def assemble(stub_va, g_tick):
     """用 nasm 汇编桩代码，返回 (机器码, {标号: VA})。"""
-    defs = {
-        'STUB_VA': stub_va, 'G_TICK': g_tick, 'G_STATE': G_STATE,
-        'FN_GET_INFO': FN_GET_INFO, 'FN_ON_DOWNLOAD': FN_ON_DOWNLOAD,
-        'FN_JUMP_APP': FN_JUMP_APP, 'CHK_ID': CHK_ID,
-        'IAT_GetTickCount': IAT_GetTickCount,
-        'IAT_SendDlgItemMessageW': IAT_SendDlgItemMessageW,
-        'SKIP_WINDOW_MS': SKIP_WINDOW_MS,
-    }
+    defs = {'STUB_VA': stub_va, 'G_TICK': g_tick, 'CHK_ID': CHK_ID, 'SKIP_WINDOW_MS': SKIP_WINDOW_MS}
+    defs.update({k: v for k, v in globals().items() if k.startswith(('FN_', 'IAT_', 'G_'))})
+    chars = lambda t: ', '.join(str(ord(c)) for c in t)
     with tempfile.TemporaryDirectory() as td:
         src, out, mapf = (os.path.join(td, n) for n in ('stub.asm', 'stub.bin', 'stub.map'))
         with open(src, 'w') as f:
             f.write('[map symbols %s]\n' % mapf)
             for k, v in defs.items():
                 f.write('%%define %s 0x%X\n' % (k, v))
+            f.write('%%define REG_KEY_CHARS %s\n' % chars(REG_KEY))
+            f.write('%%define REG_VALUE_CHARS %s\n' % chars(REG_VALUE))
             f.write(STUB_ASM)
         subprocess.check_call(['nasm', '-f', 'bin', '-o', out, src])
         code = open(out, 'rb').read()
@@ -192,6 +313,9 @@ def find_abs_relocs(code, va, image_size):
     lo, hi = IMAGE_BASE, IMAGE_BASE + image_size
     relocs, total = [], 0
     for ins in md.disasm(code, va):
+        if ins.bytes == b'\xcc':                # 代码与数据之间的对齐填充
+            total += 1
+            continue
         total += ins.size
         branch = ins.mnemonic == 'call' or ins.mnemonic.startswith('j')
         for op in ins.operands:
@@ -294,6 +418,7 @@ def main():
     stub_rva = align(text.VirtualAddress + text.Misc_VirtualSize, 16)
     stub_va = IMAGE_BASE + stub_rva
     code, labels = assemble(stub_va, g_tick)
+    code_len = labels['stub_data'] - stub_va     # 之后是字符串常量，不参与反汇编
     stub_end = stub_rva + len(code)
     assert stub_end <= sec['.rdata'].VirtualAddress, '.text 空隙不够'
     t = body['.text']
@@ -320,7 +445,7 @@ def main():
         for e in ents:
             if e >> 12:
                 assert not {page + (e & 0xFFF) + i for i in range(4)} & patched, '被改写的 call 上有重定位'
-    new_relocs = [va - IMAGE_BASE for va in find_abs_relocs(code, stub_va, opt.SizeOfImage)]
+    new_relocs = [va - IMAGE_BASE for va in find_abs_relocs(code[:code_len], stub_va, opt.SizeOfImage)]
     add_relocs(blocks, new_relocs)
     new_table = build_relocs(blocks)
     assert len(new_table) <= reloc.Misc_VirtualSize and len(new_table) <= len(r)
@@ -385,7 +510,8 @@ def main():
     with open(dst, 'wb') as f:
         f.write(out)
 
-    print('桩代码   : 0x%X..0x%X (%d 字节), 重定位 %d 处' % (stub_va, IMAGE_BASE + stub_end, len(code), len(new_relocs)))
+    print('桩代码   : 0x%X..0x%X (代码 %d + 数据 %d 字节), 重定位 %d 处'
+          % (stub_va, IMAGE_BASE + stub_end, code_len, len(code) - code_len, len(new_relocs)))
     print('变量     : 0x%X' % g_tick)
     print('对话框   : RVA 0x%X, %d 字节' % (rsrc.VirtualAddress + dlg_off, len(dlg)))
     print('输出     : %s (%d 字节)' % (os.path.normpath(dst), len(out)))
