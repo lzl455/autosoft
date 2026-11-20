@@ -45,16 +45,16 @@
    连接状态）隐藏（仍在，原程序照常读写）；加上标题栏关闭按钮；标题改为配置区里的标题。
    百分比：设置进度条位置的 5 处 SendMessageW(PBM_SETPOS) 换成钩子，发完后把
    位置写到百分比标签并立即重绘（下载时原程序不跑消息循环）。
-   进度条一直显示；右侧标签平时显示百分比，没插设备时显示“请插入USB设备”（进度条清零），
+   进度条一直显示；右侧标签平时显示百分比，没插设备时显示“请插入你的键盘”（进度条清零），
    升级成功后显示“升级成功”。设备接入处理函数的断开分支(0x402474 处的 GetDlgItem)
    和两个接入分支各挂一次。升级途中切到 BOOT (状态 3/6) 时设备会短暂断开，不提示；
    升级成功后跳回 APP 的那一次断开也不提示，保留“升级成功”。
    美化：对话框字体换成微软雅黑，窗口背景白色 (WM_CTLCOLORDLG)，右侧标签用放大 4/3 的
    粗体（按对话框字体算，跟随 DPI），文字颜色按内容区分 (WM_CTLCOLORSTATIC)：
-   百分比深灰、“请插入USB设备”蓝色、“升级成功”绿色。
+   百分比深灰、“请插入你的键盘”蓝色、“升级成功”绿色。
 11. 升级失败时进度条变红 (PBM_SETSTATE PBST_ERROR)，右侧标签换成“重试”按钮。失败判定:
     “下载程序”里调用下载流程(0x404B2F)后状态不是 5，或跳转 APP(0x404B6C)后状态不是 2。
-    点“重试”: 设备还连着就重新载入固件并下载，已拔出就显示“请插入USB设备”。
+    点“重试”: 设备还连着就重新载入固件并下载，已拔出就显示“请插入你的键盘”。
     重新下载、设备拔出或接入时恢复正常显示。
    程序图标换成 upgrader/upgrader_icon.ico（资源目录整体重建到新增的 .rsrc 节，原节改名 .oldrsrc，
    用的是 upgrader/make_upgrader.py 里的 set_icon，生成升级程序时还可以再换）。
@@ -151,7 +151,7 @@ CALL_SITES = {
 UPG_CALL_SITES = {
     0x404B6C: (FN_JUMP_APP, 'hook_jump_dl'),        # 下载成功后跳转 APP -> 自动退出 / 失败显示重试
     0x404B2F: (FN_DOWNLOAD, 'hook_download'),       # 下载流程 -> 失败显示重试
-    0x402474: (FN_CWND_GETDLGITEM, 'hook_disc'),    # 设备断开 -> 显示“请插入USB设备”
+    0x402474: (FN_CWND_GETDLGITEM, 'hook_disc'),    # 设备断开 -> 显示“请插入你的键盘”
     0x40271F: (FN_FILE_DOMODAL, 'hook_domodal'),    # 不弹选择文件对话框
     0x402782: (FN_CSTR_ASSIGN, 'hook_assign'),      # 路径 = “内置固件\<名称>”
 }
@@ -193,7 +193,7 @@ CLR_PROMPT = 0x00EB6325               # #2563EB 蓝
 CLR_DONE = 0x004AA316                 # #16A34A 绿
 RETRY_ID = 1054                       # 失败后出现的“重试”按钮
 RETRY_RECT = (226, 13, 62, 18)
-STR_NOUSB = '请插入USB设备'
+STR_NOUSB = '请插入你的键盘'
 STR_DONE = '升级成功'
 EXIT_TIMER_ID = 0xB1C5
 EXIT_DELAY_MS = 1000
@@ -555,8 +555,8 @@ hook_disc:
     pop     eax
     ret     4
 
-; ---- 设备断开：进度条清零，标签显示“请插入USB设备” ----
-; G_UI: 0 平时, 1 显示着“请插入USB设备”, 2 刚升级成功, 3 刚升级成功且设备已跳回 APP 断开过一次
+; ---- 设备断开：进度条清零，标签显示“请插入你的键盘” ----
+; G_UI: 0 平时, 1 显示着“请插入你的键盘”, 2 刚升级成功, 3 刚升级成功且设备已跳回 APP 断开过一次
 ui_disconnected:
     cmp     byte [G_UI], 2
     jne     .hint
@@ -581,7 +581,7 @@ ui_disconnected:
     call    set_label
     ret
 
-; ---- 设备接入：如果正显示“请插入USB设备”，换回 0% ----
+; ---- 设备接入：如果正显示“请插入你的键盘”，换回 0% ----
 ui_connected:
     call    clear_fail
     mov     al, [G_UI]
