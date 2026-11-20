@@ -52,6 +52,10 @@
    美化：对话框字体换成微软雅黑，窗口背景白色 (WM_CTLCOLORDLG)，右侧标签用放大 4/3 的
    粗体（按对话框字体算，跟随 DPI），文字颜色按内容区分 (WM_CTLCOLORSTATIC)：
    百分比深灰、“请插入USB设备”蓝色、“升级成功”绿色。
+11. 升级失败时进度条变红 (PBM_SETSTATE PBST_ERROR)，右侧标签换成“重试”按钮。失败判定:
+    “下载程序”里调用下载流程(0x404B2F)后状态不是 5，或跳转 APP(0x404B6C)后状态不是 2。
+    点“重试”: 设备还连着就重新载入固件并下载，已拔出就显示“请插入USB设备”。
+    重新下载、设备拔出或接入时恢复正常显示。
    程序图标换成 upgrader/upgrader_icon.ico（资源目录整体重建到新增的 .rsrc2 节，
    用的是 upgrader/make_upgrader.py 里的 set_icon，生成升级程序时还可以再换）。
 10. 升级成功后自动退出（配置区选项 CFG_AUTO_EXIT）：“下载程序”流程里跳转 APP 成功
@@ -104,6 +108,7 @@ FN_OPEN_FILE = 0x4026B0
 FN_FILE_DOMODAL = 0x41592D
 FN_CSTR_ASSIGN = 0x4013C0
 FN_CWND_GETDLGITEM = 0x40C5CE
+FN_DOWNLOAD = 0x403190
 G_STATE = 0x56E0A4
 G_CHIP = 0x56E060
 IAT_SendDlgItemMessageW = 0x51E6CC
@@ -129,6 +134,7 @@ IAT_CreateFontIndirectW = 0x51E0C4
 IAT_SetTextColor = 0x51E1B0
 IAT_SetBkMode = 0x51E194
 IAT_GetStockObject = 0x51E0AC
+IAT_ShowWindow = 0x51E6B8
 IAT_SetTimer = 0x51E5E8
 IAT_KillTimer = 0x51E5E4
 
@@ -143,7 +149,8 @@ CALL_SITES = {
 }
 # 一键升级模板额外改写的 call（E8 rel32）
 UPG_CALL_SITES = {
-    0x404B6C: (FN_JUMP_APP, 'hook_jump_dl'),        # 下载成功后跳转 APP -> 自动退出
+    0x404B6C: (FN_JUMP_APP, 'hook_jump_dl'),        # 下载成功后跳转 APP -> 自动退出 / 失败显示重试
+    0x404B2F: (FN_DOWNLOAD, 'hook_download'),       # 下载流程 -> 失败显示重试
     0x402474: (FN_CWND_GETDLGITEM, 'hook_disc'),    # 设备断开 -> 显示“请插入USB设备”
     0x40271F: (FN_FILE_DOMODAL, 'hook_domodal'),    # 不弹选择文件对话框
     0x402782: (FN_CSTR_ASSIGN, 'hook_assign'),      # 路径 = “内置固件\<名称>”
@@ -184,10 +191,12 @@ UPG_FONT = (9, 400, 'Microsoft YaHei')   # 对话框字体: 磅值, 粗细, 字�
 CLR_PERCENT = 0x0037291F              # #1F2937 深灰
 CLR_PROMPT = 0x00EB6325               # #2563EB 蓝
 CLR_DONE = 0x004AA316                 # #16A34A 绿
+RETRY_ID = 1054                       # 失败后出现的“重试”按钮
+RETRY_RECT = (226, 13, 62, 18)
 STR_NOUSB = '请插入USB设备'
 STR_DONE = '升级成功'
 EXIT_TIMER_ID = 0xB1C5
-EXIT_DELAY_MS = 3000
+EXIT_DELAY_MS = 1000
 CFG_AUTO_EXIT = 1                     # 配置区选项位: 升级成功后自动退出
 UPG_SECTION = b'.upg'
 CFG_MAGIC = b'BYCFWCF2'               # 配置区: magic(8) 固件长度(4) 选项(4) 标题 CString头(16) 路径
@@ -403,9 +412,19 @@ hook_wndproc:
 .cmd:
     cmp     dword [esp + 4], 0x111      ; WM_COMMAND
     jne     .pass
+    cmp     dword [esp + 8], RETRY_ID   ; 点了“重试”
+    jne     .kick
+    call    clear_fail
+    cmp     byte [edi + 0x10E28], 0
+    jne     .go
+    call    ui_disconnected             ; 设备已拔出 -> 提示插入
+    mov     ecx, edi
+    jmp     .pass
+.kick:
     cmp     dword [esp + 8], KICK_ID
     jne     .pass
 %ifdef SELFTEST
+.go:
     mov     dword [G_CHIP], 0x96FF00    ; 自测: 假装连着 BYC951，只载入固件
     push    esi
     mov     esi, edi
@@ -414,6 +433,7 @@ hook_wndproc:
 %else
     cmp     byte [edi + 0x10E28], 0     ; 启动时设备已连接?
     je      .pass
+.go:
     call    auto_ready
     test    eax, eax
     jz      .pass
@@ -432,7 +452,7 @@ hook_wndproc:
 hook_jump_dl:
     call    hook_jump
     cmp     dword [G_STATE], 2          ; 跳转成功 = 升级成功
-    jne     .done
+    jne     .fail
     mov     byte [G_UI], 2
     mov     byte [G_LBL], 2
     push    str_done
@@ -446,6 +466,79 @@ hook_jump_dl:
     call    [IAT_SetTimer]
 .done:
     ret
+.fail:
+    jmp     on_fail
+
+; ---- 替换 0x404B2F 处“下载程序”里对下载流程的调用（ebx = esi = this）----
+hook_download:
+    call    clear_fail
+    call    FN_DOWNLOAD
+    cmp     dword [G_STATE], 5          ; 5 = 下载校验成功
+    je      .ok
+    call    on_fail
+.ok:
+    ret
+
+; ---- 升级失败：进度条变红，右侧标签换成“重试”按钮 ----
+on_fail:
+    mov     byte [G_FAIL], 1
+    mov     eax, 2                      ; PBST_ERROR
+    jmp     fail_ui
+
+; ---- 恢复正常显示（没在失败状态时什么都不做）----
+clear_fail:
+    cmp     byte [G_FAIL], 0
+    je      .r
+    mov     byte [G_FAIL], 0
+    mov     eax, 1                      ; PBST_NORMAL
+    jmp     fail_ui
+.r:
+    ret
+
+; ---- eax = 进度条状态: 2 失败(显示重试按钮) / 1 正常(显示标签) ----
+fail_ui:
+    push    esi
+    mov     esi, eax
+    push    1007
+    push    dword [G_HWND]
+    call    [IAT_GetDlgItem]
+    test    eax, eax
+    jz      .btn
+    push    0
+    push    esi
+    push    0x410                       ; PBM_SETSTATE
+    push    eax
+    call    [IAT_SendMessageW]
+.btn:
+    xor     eax, eax                    ; SW_HIDE
+    cmp     esi, 2
+    jne     .set
+    mov     al, 5                       ; SW_SHOW
+.set:
+    push    eax
+    push    eax
+    push    RETRY_ID
+    call    show_ctl
+    pop     eax
+    xor     eax, 5
+    push    eax
+    push    PCT_ID
+    call    show_ctl
+    pop     esi
+    ret
+
+; ---- [esp+4] = 控件 ID, [esp+8] = ShowWindow 参数 ----
+show_ctl:
+    push    dword [esp + 4]
+    push    dword [G_HWND]
+    call    [IAT_GetDlgItem]
+    test    eax, eax
+    jz      .r
+    push    dword [esp + 8]
+    push    eax
+    call    [IAT_ShowWindow]
+.r:
+    ret     8
 
 ; ---- 替换 0x402474 处的 CWnd::GetDlgItem(-1)（设备断开分支, ecx = this）----
 hook_disc:
@@ -470,6 +563,7 @@ ui_disconnected:
     mov     byte [G_UI], 3              ; 升级成功后跳回 APP 的断开，保留“升级成功”
     ret
 .hint:
+    call    clear_fail
     mov     byte [G_UI], 1
     push    1007
     push    dword [G_HWND]
@@ -489,6 +583,7 @@ ui_disconnected:
 
 ; ---- 设备接入：如果正显示“请插入USB设备”，换回 0% ----
 ui_connected:
+    call    clear_fail
     mov     al, [G_UI]
     mov     byte [G_UI], 0
     cmp     al, 1
@@ -782,7 +877,8 @@ def assemble(stub_va, g_tick, g_init=0, upgrader=False, selftest=False):
             'SKIP_WINDOW_MS': SKIP_WINDOW_MS, 'UPGRADER': int(upgrader), 'KICK_ID': KICK_ID,
             'TITLE_CHARS': TITLE_CHARS, 'PATH_CHARS': PATH_CHARS, 'CFG_AUTO_EXIT': CFG_AUTO_EXIT,
             'EXIT_TIMER_ID': EXIT_TIMER_ID, 'EXIT_DELAY_MS': EXIT_DELAY_MS,
-            'G_HWND': g_hwnd, 'G_PCTBUF': g_pctbuf, 'G_UI': g_init + 24, 'G_LBL': g_init + 25,
+            'G_HWND': g_hwnd, 'G_PCTBUF': g_pctbuf, 'G_UI': g_init + 24, 'G_LBL': g_init + 25, 'G_FAIL': g_init + 26,
+            'RETRY_ID': RETRY_ID,
             'PCT_ID': PCT_ID, 'CLR_PERCENT': CLR_PERCENT, 'CLR_PROMPT': CLR_PROMPT,
             # 颜色立即数如果恰好落在映像地址范围内，会被当成地址加上重定位；高字节置 FF 再 and 掉
             'CLR_DONE_X': CLR_DONE | 0xFF000000}
@@ -980,7 +1076,9 @@ def build_dialog_upgrader(old):
     d['font'] = struct.pack('<HHBB', UPG_FONT[0], UPG_FONT[1], 0, 1) + wz(UPG_FONT[2])   # DEFAULT_CHARSET
     pct = {'fixed': bytearray(struct.pack('<IIIhhhhI', 0, 0, 0x50020202, *PCT_RECT, PCT_ID)),   # SS_RIGHT|SS_CENTERIMAGE
            'cls': struct.pack('<HH', 0xFFFF, 0x0082), 'text': wz('0%'), 'extra': b'\0\0'}
-    return serialize_dialog(d, items + [pct])
+    retry = {'fixed': bytearray(struct.pack('<IIIhhhhI', 0, 0, 0x40010000, *RETRY_RECT, RETRY_ID)),  # 先隐藏
+             'cls': struct.pack('<HH', 0xFFFF, 0x0080), 'text': wz('重试'), 'extra': b'\0\0'}
+    return serialize_dialog(d, items + [pct, retry])
 
 
 def build(src, dst, upgrader=False, selftest=False):

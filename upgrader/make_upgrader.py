@@ -13,7 +13,7 @@
 只用到 Python 标准库（Python 3.6 及以上），不需要安装其它东西。
 
 生成的 exe = 模板 + 配置区（固件长度、选项、标题、固件名）+ 文件末尾附加的固件。
-默认升级成功 3 秒后自动退出；加 --no-exit 则保持打开，可以连续升级多台。
+默认升级成功 1 秒后自动退出；加 --no-exit 则保持打开，可以连续升级多台。
 升级程序运行时以只读方式打开自身，从“文件末尾 - 固件长度”处读出固件，
 交给原程序照常解析、下载、校验。
 """
@@ -301,7 +301,7 @@ def make_one(path, output, title, template, auto_exit, icon=None):
         f.write(exe)
     print('固件     : %s (%d 字节)' % (path, len(fw)))
     print('窗口标题 : %s' % title[:TITLE_CHARS - 1])
-    print('升级成功 : %s' % ('3 秒后自动退出' if auto_exit else '保持打开，可连续升级'))
+    print('升级成功 : %s' % ('1 秒后自动退出' if auto_exit else '保持打开，可连续升级'))
     print('图标     : %s' % (icon[0] if icon else '默认'))
     print('已生成   : %s' % out)
 
