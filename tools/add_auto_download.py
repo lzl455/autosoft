@@ -42,6 +42,8 @@
    启动时已经连着的设备：OnInitDialog 结束后投递一条 WM_COMMAND(KICK_ID)，
    在消息循环里载入固件并开始下载（避免在窗口显示之前就开始烧录）。
 9. 对话框隐藏“打开文件”按钮，复选框换成操作提示，标题改为配置区里的标题。
+   程序图标换成 upgrader/upgrader_icon.ico（资源目录整体重建到新增的 .rsrc2 节，
+   用的是 upgrader/make_upgrader.py 里的 set_icon，生成升级程序时还可以再换）。
 10. 升级成功后自动退出（配置区选项 CFG_AUTO_EXIT）：“下载程序”流程里跳转 APP 成功
     (0x404B6C) 时把标题改成提示，启动一个 EXIT_DELAY_MS 的定时器；定时器到点后
     投递 WM_COMMAND(IDCANCEL)，与点“退出”相同。“读取程序”后的跳转(0x404212)不触发。
@@ -885,7 +887,14 @@ def build(src, dst, upgrader=False, selftest=False):
             struct.pack_into('<I', body[en], eo + 24, new_ptr[n] + o)
 
     out = bytes(hdr) + b''.join(bytes(body[n]) for n in names)
+    if upgrader:
+        here = os.path.dirname(os.path.abspath(__file__))
+        sys.path.insert(0, os.path.join(here, '..', 'upgrader'))
+        import make_upgrader
+        with open(os.path.join(here, '..', 'upgrader', 'upgrader_icon.ico'), 'rb') as f:
+            out = make_upgrader.set_icon(out, f.read())
     chk = pefile.PE(data=out)
+    assert not chk.get_warnings(), chk.get_warnings()
     chk.OPTIONAL_HEADER.CheckSum = chk.generate_checksum()
     out = chk.write()
     os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
