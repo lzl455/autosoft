@@ -49,6 +49,9 @@
    升级成功后显示“升级成功”。设备接入处理函数的断开分支(0x402474 处的 GetDlgItem)
    和两个接入分支各挂一次。升级途中切到 BOOT (状态 3/6) 时设备会短暂断开，不提示；
    升级成功后跳回 APP 的那一次断开也不提示，保留“升级成功”。
+   美化：对话框字体换成微软雅黑，窗口背景白色 (WM_CTLCOLORDLG)，右侧标签用放大 4/3 的
+   粗体（按对话框字体算，跟随 DPI），文字颜色按内容区分 (WM_CTLCOLORSTATIC)：
+   百分比深灰、“请插入USB设备”蓝色、“升级成功”绿色。
    程序图标换成 upgrader/upgrader_icon.ico（资源目录整体重建到新增的 .rsrc2 节，
    用的是 upgrader/make_upgrader.py 里的 set_icon，生成升级程序时还可以再换）。
 10. 升级成功后自动退出（配置区选项 CFG_AUTO_EXIT）：“下载程序”流程里跳转 APP 成功
@@ -121,6 +124,11 @@ IAT_PostMessageW = 0x51E830
 IAT_SendMessageW = 0x51E844
 IAT_GetDlgItem = 0x51E754
 IAT_UpdateWindow = 0x51E84C
+IAT_GetObjectW = 0x51E1A8
+IAT_CreateFontIndirectW = 0x51E0C4
+IAT_SetTextColor = 0x51E1B0
+IAT_SetBkMode = 0x51E194
+IAT_GetStockObject = 0x51E0AC
 IAT_SetTimer = 0x51E5E8
 IAT_KillTimer = 0x51E5E4
 
@@ -166,11 +174,16 @@ REG_VALUE = 'AutoDownload'
 KICK_ID = 1051                        # 启动后投递的 WM_COMMAND id
 UPG_DLG_TITLE = '固件升级'             # 资源里的标题（配置区标题为空时显示）
 PCT_ID = 1052                         # 百分比标签
-UPG_DLG_SIZE = (300, 36)              # 精简后的对话框大小 (DLU)
+UPG_DLG_SIZE = (300, 44)              # 精简后的对话框大小 (DLU)
 UPG_LAYOUT = {                        # 留下的控件: 识别方式 -> (x, y, cx, cy)
-    1007: (8, 10, 212, 16),           # 进度条
+    1007: (14, 16, 182, 12),          # 进度条
 }
-PCT_RECT = (224, 13, 68, 10)          # 进度条右侧标签（右对齐）
+PCT_RECT = (200, 8, 88, 28)           # 进度条右侧标签（右对齐、垂直居中）
+UPG_FONT = (9, 400, 'Microsoft YaHei')   # 对话框字体: 磅值, 粗细, 字体名（Vista 起自带）
+# 标签颜色 (COLORREF = 0x00BBGGRR)
+CLR_PERCENT = 0x0037291F              # #1F2937 深灰
+CLR_PROMPT = 0x00EB6325               # #2563EB 蓝
+CLR_DONE = 0x004AA316                 # #16A34A 绿
 STR_NOUSB = '请插入USB设备'
 STR_DONE = '升级成功'
 EXIT_TIMER_ID = 0xB1C5
@@ -277,6 +290,7 @@ load_fw:
 hook_init:
     mov     eax, [edi + 0x20]
     mov     [G_HWND], eax
+    call    init_label_font
     mov     byte [G_INIT], 1
     call    FN_OPEN_DEVICE
     mov     byte [G_INIT], 0
@@ -293,9 +307,85 @@ hook_init:
     call    [IAT_PostMessageW]
     ret
 
+; ---- 右侧标签换成放大 4/3 的粗体（以对话框字体为基准，自动跟随 DPI）----
+init_label_font:
+    sub     esp, 92                     ; LOGFONTW
+    push    0
+    push    0
+    push    0x31                        ; WM_GETFONT
+    push    dword [G_HWND]
+    call    [IAT_SendMessageW]
+    test    eax, eax
+    jz      .out
+    mov     ecx, esp
+    push    ecx
+    push    92
+    push    eax
+    call    [IAT_GetObjectW]
+    test    eax, eax
+    jz      .out
+    mov     eax, [esp]                  ; lfHeight（通常为负数）
+    shl     eax, 2
+    cdq
+    mov     ecx, 3
+    idiv    ecx
+    mov     [esp], eax
+    mov     dword [esp + 16], 700       ; lfWeight = FW_BOLD
+    mov     byte [esp + 26], 5          ; lfQuality = CLEARTYPE_QUALITY
+    push    esp
+    call    [IAT_CreateFontIndirectW]
+    test    eax, eax
+    jz      .out
+    push    eax
+    push    PCT_ID
+    push    dword [G_HWND]
+    call    [IAT_GetDlgItem]
+    pop     ecx
+    test    eax, eax
+    jz      .out
+    push    1
+    push    ecx
+    push    0x30                        ; WM_SETFONT
+    push    eax
+    call    [IAT_SendMessageW]
+.out:
+    add     esp, 92
+    ret
+
 ; ---- WindowProc: 替换 0x402611 处转给基类的 call ----
 ; ecx = edi = this, [esp+4] = msg, [esp+8] = wParam, [esp+12] = lParam
 hook_wndproc:
+    cmp     dword [esp + 4], 0x136      ; WM_CTLCOLORDLG -> 白色背景
+    je      .white
+    cmp     dword [esp + 4], 0x138      ; WM_CTLCOLORSTATIC
+    jne     .timer
+    push    PCT_ID
+    push    dword [G_HWND]
+    call    [IAT_GetDlgItem]
+    mov     ecx, edi
+    cmp     eax, [esp + 12]             ; 只管右侧标签
+    jne     .pass
+    mov     eax, CLR_PERCENT
+    cmp     byte [G_LBL], 1
+    jne     .c2
+    mov     eax, CLR_PROMPT
+.c2:
+    cmp     byte [G_LBL], 2
+    jne     .c3
+    mov     eax, CLR_DONE_X             ; 见 assemble(): 避免立即数落在映像地址范围内
+    and     eax, 0x00FFFFFF
+.c3:
+    push    eax
+    push    dword [esp + 12]            ; hdc
+    call    [IAT_SetTextColor]
+    push    1                           ; TRANSPARENT
+    push    dword [esp + 12]
+    call    [IAT_SetBkMode]
+.white:
+    push    0                           ; WHITE_BRUSH
+    call    [IAT_GetStockObject]
+    ret     12
+.timer:
     cmp     dword [esp + 4], 0x113      ; WM_TIMER
     jne     .cmd
     cmp     dword [esp + 8], EXIT_TIMER_ID
@@ -344,6 +434,7 @@ hook_jump_dl:
     cmp     dword [G_STATE], 2          ; 跳转成功 = 升级成功
     jne     .done
     mov     byte [G_UI], 2
+    mov     byte [G_LBL], 2
     push    str_done
     call    set_label
     test    byte [cfg_flags], CFG_AUTO_EXIT
@@ -391,6 +482,7 @@ ui_disconnected:
     push    eax
     call    [IAT_SendMessageW]
 .label:
+    mov     byte [G_LBL], 1
     push    str_nousb
     call    set_label
     ret
@@ -401,6 +493,7 @@ ui_connected:
     mov     byte [G_UI], 0
     cmp     al, 1
     jne     .r
+    mov     byte [G_LBL], 0
     push    str_zero
     call    set_label
 .r:
@@ -464,6 +557,7 @@ show_percent:
     mov     [ebx], ax
     mov     dword [ebx + 2], '%'
 .set:
+    mov     byte [G_LBL], 0
     push    ebx
     call    set_label
     pop     ebx
@@ -688,7 +782,12 @@ def assemble(stub_va, g_tick, g_init=0, upgrader=False, selftest=False):
             'SKIP_WINDOW_MS': SKIP_WINDOW_MS, 'UPGRADER': int(upgrader), 'KICK_ID': KICK_ID,
             'TITLE_CHARS': TITLE_CHARS, 'PATH_CHARS': PATH_CHARS, 'CFG_AUTO_EXIT': CFG_AUTO_EXIT,
             'EXIT_TIMER_ID': EXIT_TIMER_ID, 'EXIT_DELAY_MS': EXIT_DELAY_MS,
-            'G_HWND': g_hwnd, 'G_PCTBUF': g_pctbuf, 'G_UI': g_init + 24, 'PCT_ID': PCT_ID}
+            'G_HWND': g_hwnd, 'G_PCTBUF': g_pctbuf, 'G_UI': g_init + 24, 'G_LBL': g_init + 25,
+            'PCT_ID': PCT_ID, 'CLR_PERCENT': CLR_PERCENT, 'CLR_PROMPT': CLR_PROMPT,
+            # 颜色立即数如果恰好落在映像地址范围内，会被当成地址加上重定位；高字节置 FF 再 and 掉
+            'CLR_DONE_X': CLR_DONE | 0xFF000000}
+    for k in ('CLR_PERCENT', 'CLR_PROMPT'):
+        assert not IMAGE_BASE <= defs[k] < IMAGE_BASE + 0x200000, k
     defs.update({k: v for k, v in globals().items() if k.startswith(('FN_', 'IAT_', 'G_')) and k not in defs})
     chars = lambda t: ', '.join(str(ord(c)) for c in t)
     with tempfile.TemporaryDirectory() as td:
@@ -878,7 +977,8 @@ def build_dialog_upgrader(old):
         else:
             struct.pack_into('<I', it['fixed'], 8, st & ~0x10000000)                 # 去掉 WS_VISIBLE
     assert kept == set(UPG_LAYOUT), kept
-    pct = {'fixed': bytearray(struct.pack('<IIIhhhhI', 0, 0, 0x50020002, *PCT_RECT, PCT_ID)),   # SS_RIGHT
+    d['font'] = struct.pack('<HHBB', UPG_FONT[0], UPG_FONT[1], 0, 1) + wz(UPG_FONT[2])   # DEFAULT_CHARSET
+    pct = {'fixed': bytearray(struct.pack('<IIIhhhhI', 0, 0, 0x50020202, *PCT_RECT, PCT_ID)),   # SS_RIGHT|SS_CENTERIMAGE
            'cls': struct.pack('<HH', 0xFFFF, 0x0082), 'text': wz('0%'), 'extra': b'\0\0'}
     return serialize_dialog(d, items + [pct])
 
