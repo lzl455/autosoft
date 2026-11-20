@@ -45,13 +45,14 @@
    连接状态）隐藏（仍在，原程序照常读写）；加上标题栏关闭按钮；标题改为配置区里的标题。
    百分比：设置进度条位置的 5 处 SendMessageW(PBM_SETPOS) 换成钩子，发完后把
    位置写到百分比标签并立即重绘（下载时原程序不跑消息循环）。
-   没插设备时进度条和百分比隐藏，显示“请插入 USB 设备”：设备接入处理函数的断开分支
-   (0x402474 处的 GetDlgItem) 和两个接入分支各挂一次切换。升级途中切到 BOOT
-   (状态 3/6) 时设备会短暂断开，这时不切换。
+   进度条一直显示；右侧标签平时显示百分比，没插设备时显示“请插入USB设备”（进度条清零），
+   升级成功后显示“升级成功”。设备接入处理函数的断开分支(0x402474 处的 GetDlgItem)
+   和两个接入分支各挂一次。升级途中切到 BOOT (状态 3/6) 时设备会短暂断开，不提示；
+   升级成功后跳回 APP 的那一次断开也不提示，保留“升级成功”。
    程序图标换成 upgrader/upgrader_icon.ico（资源目录整体重建到新增的 .rsrc2 节，
    用的是 upgrader/make_upgrader.py 里的 set_icon，生成升级程序时还可以再换）。
 10. 升级成功后自动退出（配置区选项 CFG_AUTO_EXIT）：“下载程序”流程里跳转 APP 成功
-    (0x404B6C) 时把标题改成提示，启动一个 EXIT_DELAY_MS 的定时器；定时器到点后
+    (0x404B6C) 时显示“升级成功”，启动一个 EXIT_DELAY_MS 的定时器；定时器到点后
     投递 WM_COMMAND(IDCANCEL)，与点“退出”相同。“读取程序”后的跳转(0x404212)不触发。
 
 原程序里与本补丁有关的内容（逆向所得）
@@ -120,7 +121,6 @@ IAT_PostMessageW = 0x51E830
 IAT_SendMessageW = 0x51E844
 IAT_GetDlgItem = 0x51E754
 IAT_UpdateWindow = 0x51E84C
-IAT_ShowWindow = 0x51E6B8
 IAT_SetTimer = 0x51E5E8
 IAT_KillTimer = 0x51E5E4
 
@@ -136,7 +136,7 @@ CALL_SITES = {
 # 一键升级模板额外改写的 call（E8 rel32）
 UPG_CALL_SITES = {
     0x404B6C: (FN_JUMP_APP, 'hook_jump_dl'),        # 下载成功后跳转 APP -> 自动退出
-    0x402474: (FN_CWND_GETDLGITEM, 'hook_disc'),    # 设备断开 -> 显示“请插入 USB 设备”
+    0x402474: (FN_CWND_GETDLGITEM, 'hook_disc'),    # 设备断开 -> 显示“请插入USB设备”
     0x40271F: (FN_FILE_DOMODAL, 'hook_domodal'),    # 不弹选择文件对话框
     0x402782: (FN_CSTR_ASSIGN, 'hook_assign'),      # 路径 = “内置固件\<名称>”
 }
@@ -164,17 +164,15 @@ REG_VALUE = 'AutoDownload'
 
 # 一键升级模板
 KICK_ID = 1051                        # 启动后投递的 WM_COMMAND id
-UPG_DLG_TITLE = '固件升级工具'         # 资源里的标题（配置区标题为空时显示）
+UPG_DLG_TITLE = '固件升级'             # 资源里的标题（配置区标题为空时显示）
 PCT_ID = 1052                         # 百分比标签
 UPG_DLG_SIZE = (300, 36)              # 精简后的对话框大小 (DLU)
 UPG_LAYOUT = {                        # 留下的控件: 识别方式 -> (x, y, cx, cy)
-    1007: (8, 10, 250, 16),           # 进度条
+    1007: (8, 10, 212, 16),           # 进度条
 }
-PCT_RECT = (262, 13, 30, 10)
-HINT_ID = 1053                        # “请插入 USB 设备”
-HINT_TEXT = '请插入 USB 设备'
-HINT_RECT = (8, 13, 284, 10)
-UPG_DONE_TITLE = '升级成功，3 秒后自动退出'
+PCT_RECT = (224, 13, 68, 10)          # 进度条右侧标签（右对齐）
+STR_NOUSB = '请插入USB设备'
+STR_DONE = '升级成功'
 EXIT_TIMER_ID = 0xB1C5
 EXIT_DELAY_MS = 3000
 CFG_AUTO_EXIT = 1                     # 配置区选项位: 升级成功后自动退出
@@ -192,8 +190,7 @@ org STUB_VA
 hook_boot:
     call    FN_GET_INFO
 %if UPGRADER
-    mov     eax, 1
-    call    show_ui                     ; 设备已连接 -> 显示进度条
+    call    ui_connected
     cmp     byte [G_INIT], 0
     jne     .done                       ; 启动时的首次连接交给 KICK 消息
 %endif
@@ -219,8 +216,7 @@ hook_boot:
 hook_app:
     call    FN_GET_INFO
 %if UPGRADER
-    mov     eax, 1
-    call    show_ui
+    call    ui_connected
     cmp     byte [G_INIT], 0
     jne     .done
 %endif
@@ -347,11 +343,11 @@ hook_jump_dl:
     call    hook_jump
     cmp     dword [G_STATE], 2          ; 跳转成功 = 升级成功
     jne     .done
+    mov     byte [G_UI], 2
+    push    str_done
+    call    set_label
     test    byte [cfg_flags], CFG_AUTO_EXIT
     jz      .done
-    push    str_done_title
-    push    dword [esi + 0x20]
-    call    [IAT_SetWindowTextW]
     push    0
     push    EXIT_DELAY_MS
     push    EXIT_TIMER_ID
@@ -370,38 +366,58 @@ hook_disc:
     je      .keep
     cmp     eax, 6
     je      .keep
-    xor     eax, eax
-    call    show_ui
+    call    ui_disconnected
 .keep:
     pop     eax
     ret     4
 
-; ---- eax != 0: 显示进度条和百分比; eax == 0: 显示“请插入 USB 设备” ----
-show_ui:
-    push    esi
-    neg     eax
-    sbb     esi, esi
-    and     esi, 5                      ; SW_SHOW / SW_HIDE
+; ---- 设备断开：进度条清零，标签显示“请插入USB设备” ----
+; G_UI: 0 平时, 1 显示着“请插入USB设备”, 2 刚升级成功, 3 刚升级成功且设备已跳回 APP 断开过一次
+ui_disconnected:
+    cmp     byte [G_UI], 2
+    jne     .hint
+    mov     byte [G_UI], 3              ; 升级成功后跳回 APP 的断开，保留“升级成功”
+    ret
+.hint:
+    mov     byte [G_UI], 1
     push    1007
-    call    show_item
-    push    PCT_ID
-    call    show_item
-    xor     esi, 5
-    push    HINT_ID
-    call    show_item
-    pop     esi
+    push    dword [G_HWND]
+    call    [IAT_GetDlgItem]
+    test    eax, eax
+    jz      .label
+    push    0
+    push    0
+    push    0x402                       ; PBM_SETPOS 0（直接发，不经过钩子）
+    push    eax
+    call    [IAT_SendMessageW]
+.label:
+    push    str_nousb
+    call    set_label
     ret
 
-; ---- [esp+4] = 控件 ID, esi = ShowWindow 参数 ----
-show_item:
-    push    dword [esp + 4]
+; ---- 设备接入：如果正显示“请插入USB设备”，换回 0% ----
+ui_connected:
+    mov     al, [G_UI]
+    mov     byte [G_UI], 0
+    cmp     al, 1
+    jne     .r
+    push    str_zero
+    call    set_label
+.r:
+    ret
+
+; ---- [esp+4] = 文字，写到进度条右侧标签并立即重绘 ----
+set_label:
+    push    PCT_ID
     push    dword [G_HWND]
     call    [IAT_GetDlgItem]
     test    eax, eax
     jz      .r
-    push    esi
+    push    eax                         ; UpdateWindow 的参数
+    push    dword [esp + 8]
     push    eax
-    call    [IAT_ShowWindow]
+    call    [IAT_SetWindowTextW]
+    call    [IAT_UpdateWindow]
 .r:
     ret     4
 
@@ -448,17 +464,8 @@ show_percent:
     mov     [ebx], ax
     mov     dword [ebx + 2], '%'
 .set:
-    push    PCT_ID
-    push    dword [G_HWND]
-    call    [IAT_GetDlgItem]
-    test    eax, eax
-    jz      .out
-    push    eax                         ; UpdateWindow 的参数
     push    ebx
-    push    eax
-    call    [IAT_SetWindowTextW]
-    call    [IAT_UpdateWindow]
-.out:
+    call    set_label
     pop     ebx
     ret
 
@@ -660,7 +667,9 @@ cfg_flags:  dd 0
 cfg_title:  times TITLE_CHARS dw 0
 fw_hdr:     dd 0, 0, 0, -1              ; 伪 CStringData: StringMgr, 长度, 容量, 引用(-1=锁定)
 fw_path:    times PATH_CHARS dw 0
-str_done_title: dw DONE_TITLE_CHARS, 0
+str_nousb:  dw NOUSB_CHARS, 0
+str_done:   dw DONE_CHARS, 0
+str_zero:   dw '0', '%', 0
 %else
 str_key:    dw REG_KEY_CHARS, 0
 str_value:  dw REG_VALUE_CHARS, 0
@@ -679,7 +688,7 @@ def assemble(stub_va, g_tick, g_init=0, upgrader=False, selftest=False):
             'SKIP_WINDOW_MS': SKIP_WINDOW_MS, 'UPGRADER': int(upgrader), 'KICK_ID': KICK_ID,
             'TITLE_CHARS': TITLE_CHARS, 'PATH_CHARS': PATH_CHARS, 'CFG_AUTO_EXIT': CFG_AUTO_EXIT,
             'EXIT_TIMER_ID': EXIT_TIMER_ID, 'EXIT_DELAY_MS': EXIT_DELAY_MS,
-            'G_HWND': g_hwnd, 'G_PCTBUF': g_pctbuf, 'PCT_ID': PCT_ID, 'HINT_ID': HINT_ID}
+            'G_HWND': g_hwnd, 'G_PCTBUF': g_pctbuf, 'G_UI': g_init + 24, 'PCT_ID': PCT_ID}
     defs.update({k: v for k, v in globals().items() if k.startswith(('FN_', 'IAT_', 'G_')) and k not in defs})
     chars = lambda t: ', '.join(str(ord(c)) for c in t)
     with tempfile.TemporaryDirectory() as td:
@@ -691,7 +700,8 @@ def assemble(stub_va, g_tick, g_init=0, upgrader=False, selftest=False):
             f.write('%%define REG_KEY_CHARS %s\n' % chars(REG_KEY))
             f.write('%%define REG_VALUE_CHARS %s\n' % chars(REG_VALUE))
             f.write("%%define CFG_MAGIC_STR '%s'\n" % CFG_MAGIC.decode())
-            f.write('%%define DONE_TITLE_CHARS %s\n' % chars(UPG_DONE_TITLE))
+            f.write('%%define NOUSB_CHARS %s\n' % chars(STR_NOUSB))
+            f.write('%%define DONE_CHARS %s\n' % chars(STR_DONE))
             if selftest:
                 f.write('%define SELFTEST 1\n')
             f.write(STUB_ASM)
@@ -868,14 +878,9 @@ def build_dialog_upgrader(old):
         else:
             struct.pack_into('<I', it['fixed'], 8, st & ~0x10000000)                 # 去掉 WS_VISIBLE
     assert kept == set(UPG_LAYOUT), kept
-    for it in items:                                                             # 进度条先隐藏
-        if struct.unpack_from('<I', it['fixed'], 20)[0] == 1007:
-            struct.pack_into('<I', it['fixed'], 8, struct.unpack_from('<I', it['fixed'], 8)[0] & ~0x10000000)
-    pct = {'fixed': bytearray(struct.pack('<IIIhhhhI', 0, 0, 0x40020002, *PCT_RECT, PCT_ID)),   # SS_RIGHT, 先隐藏
+    pct = {'fixed': bytearray(struct.pack('<IIIhhhhI', 0, 0, 0x50020002, *PCT_RECT, PCT_ID)),   # SS_RIGHT
            'cls': struct.pack('<HH', 0xFFFF, 0x0082), 'text': wz('0%'), 'extra': b'\0\0'}
-    hint = {'fixed': bytearray(struct.pack('<IIIhhhhI', 0, 0, 0x50020001, *HINT_RECT, HINT_ID)),  # SS_CENTER
-            'cls': struct.pack('<HH', 0xFFFF, 0x0082), 'text': wz(HINT_TEXT), 'extra': b'\0\0'}
-    return serialize_dialog(d, items + [pct, hint])
+    return serialize_dialog(d, items + [pct])
 
 
 def build(src, dst, upgrader=False, selftest=False):
@@ -903,7 +908,7 @@ def build(src, dst, upgrader=False, selftest=False):
     data = sec['.data']
     g_tick_rva = align(data.VirtualAddress + data.Misc_VirtualSize, 4)
     g_init_rva = g_tick_rva + 4
-    data_vsize = (g_init_rva + 24 if upgrader else g_tick_rva + 4) - data.VirtualAddress   # G_INIT, G_HWND, G_PCTBUF[16]
+    data_vsize = (g_init_rva + 28 if upgrader else g_tick_rva + 4) - data.VirtualAddress   # G_INIT, G_HWND, G_PCTBUF[16], G_UI
     assert data_vsize <= align(data.Misc_VirtualSize, 0x1000)
     g_tick, g_init = IMAGE_BASE + g_tick_rva, IMAGE_BASE + g_init_rva
 

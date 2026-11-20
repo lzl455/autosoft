@@ -293,7 +293,7 @@ def make_one(path, output, title, template, auto_exit, icon=None):
     name = os.path.basename(path)
     stem = os.path.splitext(name)[0]
     out = output or os.path.join(os.path.dirname(os.path.abspath(path)), stem + '_升级.exe')
-    title = title if title is not None else '固件升级 - ' + name
+    title = title if title is not None else '固件升级'
     with open(path, 'rb') as f:
         fw = f.read()
     exe = build(template, fw, title, name, auto_exit, icon[1] if icon else None)
@@ -312,7 +312,7 @@ def main():
     ap.add_argument('bin', nargs='*', help='固件 .bin 文件（可以一次给多个）；'
                     '混在里面的 .ico/.png 会被当作图标')
     ap.add_argument('-o', '--output', help='输出 exe（只给一个 .bin 时可用；默认: 与 .bin 同目录，<名称>_升级.exe）')
-    ap.add_argument('--title', help='窗口标题（默认: 固件升级 - <文件名>）')
+    ap.add_argument('--title', help='窗口标题（默认: 固件升级）')
     ap.add_argument('--icon', help='程序图标 .ico（或不超过 256x256 的正方形 .png）')
     ap.add_argument('--no-exit', action='store_true', help='升级成功后不自动退出（连续升级多台时用）')
     ap.add_argument('--template', default=os.path.join(here, 'Upgrader_Template.exe'), help='模板 exe')
