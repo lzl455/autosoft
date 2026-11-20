@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-给 BootLoader_Tools_v3.5.7.1.exe（BYC USB 烧录软件，仅有二进制）增加“自动下载模式”。
+给 BootLoader_Tools_v3.5.7.1.exe（BYC USB 烧录软件，仅有二进制）增加“自动下载模式”，
+或生成“一键升级程序”的模板。
 
 用法:
     python3 tools/add_auto_download.py [原始exe] [输出exe]
+        -> BootLoader_Tools_v3.5.7.1_AutoDL.exe（带“自动下载模式”复选框）
+    python3 tools/add_auto_download.py --upgrader [原始exe] [输出exe]
+        -> upgrader/Upgrader_Template.exe（一键升级程序模板，
+           再用 upgrader/make_upgrader.py 把 .bin 装进去）
 
 依赖: python3, pefile, capstone, nasm
 
@@ -23,6 +28,21 @@
    AutoDownload (DWORD) 里。点击复选框时立即写入（挂在对话框 WindowProc 转给
    基类的那个 call 上），OnInitDialog 里打开设备之前读回并设置复选框。
 
+一键升级模板（--upgrader）在上面 1~3 的基础上：
+5. 固件附加在 exe 文件末尾（由 make_upgrader.py 写入），模板里留有一块以
+   CFG_MAGIC 开头的配置区：固件长度、窗口标题、伪造的 CString（内容为
+   “内置固件\\<文件名>”）。
+6. “打开文件”处理函数(0x4026B0)里：CFileDialog::DoModal 直接返回 IDOK；
+   给烧录文件路径赋值时换成上面的伪造 CString。于是原程序照常解析固件、
+   显示版本和校验和。
+7. 打开烧录文件的 3 处 CreateFileW 换成钩子：文件名等于“内置固件\\...”时，
+   改为以只读共享方式打开 exe 自身，并把文件指针移到“文件末尾 - 固件长度”。
+   之后原程序自己的 ReadFile/CloseHandle 读到的就是固件，长度也与原文件一致。
+8. 不再需要复选框，自动下载始终开启；设备接入时先载入内置固件再开始下载。
+   启动时已经连着的设备：OnInitDialog 结束后投递一条 WM_COMMAND(KICK_ID)，
+   在消息循环里载入固件并开始下载（避免在窗口显示之前就开始烧录）。
+9. 对话框隐藏“打开文件”按钮，复选框换成操作提示，标题改为配置区里的标题。
+
 原程序里与本补丁有关的内容（逆向所得）
     0x56E0A4  DWORD 状态机: 0 空闲 / 3 等待进BOOT后下载 / 6 等待进BOOT后读取
                             5 下载校验成功 / 2 跳转APP成功
@@ -35,7 +55,14 @@
     0x4024D0  查找并打开设备 (edi = this)，OnInitDialog 在 0x40223A 调用
     0x4068DB  基类 WindowProc (ecx = this; msg, wParam, lParam)，
               对话框自己的 WindowProc(0x4025A0, edi = this) 在 0x402611 调用
+    0x4026B0  “打开文件”按钮处理函数 (ecx = this)：选文件、读文件、按芯片解析
+    0x41592D  CFileDialog::DoModal，在 0x40271F 调用
+    0x4013C0  CString::operator=(const CString&)，在 0x402782 给路径赋值
+              源串的 StringMgr 与目标不同时只读源串的数据和 [data-0xC] 长度
+    0x4027C1 / 0x402ADB / 0x403411  call [CreateFileW] 打开烧录文件
+    0x56E060  DWORD 芯片 ID（决定读取长度）
 """
+import argparse
 import hashlib
 import os
 import struct
@@ -58,7 +85,11 @@ FN_ON_DOWNLOAD = 0x4049C0
 FN_JUMP_APP = 0x404290
 FN_OPEN_DEVICE = 0x4024D0
 FN_BASE_WNDPROC = 0x4068DB
+FN_OPEN_FILE = 0x4026B0
+FN_FILE_DOMODAL = 0x41592D
+FN_CSTR_ASSIGN = 0x4013C0
 G_STATE = 0x56E0A4
+G_CHIP = 0x56E060
 IAT_SendDlgItemMessageW = 0x51E6CC
 IAT_GetTickCount = 0x51E374
 IAT_CheckDlgButton = 0x51E6C8
@@ -67,6 +98,13 @@ IAT_RegOpenKeyExW = 0x51E004
 IAT_RegCreateKeyExW = 0x51E008
 IAT_RegSetValueExW = 0x51E00C
 IAT_RegCloseKey = 0x51E020
+IAT_CreateFileW = 0x51E204
+IAT_CloseHandle = 0x51E208
+IAT_lstrcmpW = 0x51E23C
+IAT_GetModuleFileNameW = 0x51E2A8
+IAT_SetFilePointer = 0x51E3D0
+IAT_SetWindowTextW = 0x51E6C0
+IAT_PostMessageW = 0x51E830
 
 # 被改写的 call 指令（均为 E8 rel32，不带重定位）: 地址 -> (原目标, 新目标标号)
 CALL_SITES = {
@@ -76,6 +114,17 @@ CALL_SITES = {
     0x404B6C: (FN_JUMP_APP, 'hook_jump'),   # 下载程序成功后跳转 APP
     0x40223A: (FN_OPEN_DEVICE, 'hook_init'),        # OnInitDialog: 首次打开设备之前
     0x402611: (FN_BASE_WNDPROC, 'hook_wndproc'),    # WindowProc: 转给基类之前
+}
+# 一键升级模板额外改写的 call（E8 rel32）
+UPG_CALL_SITES = {
+    0x40271F: (FN_FILE_DOMODAL, 'hook_domodal'),    # 不弹选择文件对话框
+    0x402782: (FN_CSTR_ASSIGN, 'hook_assign'),      # 路径 = “内置固件\<名称>”
+}
+# 一键升级模板额外改写的 call [IAT]（FF 15 abs32，6 字节，带重定位）-> call rel32 + nop
+UPG_IAT_SITES = {
+    0x4027C1: (IAT_CreateFileW, 'hook_createfile'),
+    0x402ADB: (IAT_CreateFileW, 'hook_createfile'),
+    0x403411: (IAT_CreateFileW, 'hook_createfile'),
 }
 
 # ---- 新增内容 --------------------------------------------------------------
@@ -88,6 +137,16 @@ SKIP_WINDOW_MS = 15000
 REG_KEY = r'Software\BYC\BootLoader_Tools'    # 在 HKEY_CURRENT_USER 下
 REG_VALUE = 'AutoDownload'
 
+# 一键升级模板
+KICK_ID = 1051                        # 启动后投递的 WM_COMMAND id
+UPG_DLG_TITLE = '固件升级工具'         # 资源里的标题（配置区标题为空时显示）
+UPG_HINT = '插入设备即自动升级，提示“程序更新成功！”后拔出换下一台'
+UPG_SECTION = b'.upg'
+CFG_MAGIC = b'BYCFWCF1'               # 配置区: magic(8) 固件长度(4) 标题 CString头(16) 路径
+TITLE_CHARS = 96                      # 含结尾 0
+PATH_CHARS = 128                      # 含结尾 0
+PATH_PREFIX = '内置固件\\'
+
 STUB_ASM = r'''
 bits 32
 org STUB_VA
@@ -95,6 +154,10 @@ org STUB_VA
 ; ---- BOOT 模式接入: 替换 0x4023FE 处的 call 读取设备信息 (esi = this) ----
 hook_boot:
     call    FN_GET_INFO
+%if UPGRADER
+    cmp     byte [G_INIT], 0
+    jne     .done                       ; 启动时的首次连接交给 KICK 消息
+%endif
     call    recently_done
     test    eax, eax
     jnz     .done                       ; 刚烧完的设备又回来了 -> 不触发
@@ -106,6 +169,9 @@ hook_boot:
     call    auto_ready
     test    eax, eax
     jz      .done
+%if UPGRADER
+    call    load_fw
+%endif
     mov     dword [G_STATE], 3          ; 原程序随后会自己调用下载流程
 .done:
     ret
@@ -113,12 +179,19 @@ hook_boot:
 ; ---- 正常模式接入: 替换 0x402446 处的 call 读取设备信息 (esi = this) ----
 hook_app:
     call    FN_GET_INFO
+%if UPGRADER
+    cmp     byte [G_INIT], 0
+    jne     .done
+%endif
     call    recently_done
     test    eax, eax
     jnz     .done
     call    auto_ready
     test    eax, eax
     jz      .done
+%if UPGRADER
+    call    load_fw
+%endif
     mov     ecx, esi
     call    FN_ON_DOWNLOAD              ; 发切换命令, 状态置 3
 .done:
@@ -150,6 +223,137 @@ recently_done:
 .ret:
     ret
 
+%if UPGRADER
+; ---- eax != 0: 已内置固件 ----
+auto_ready:
+    mov     eax, [fw_len]
+    neg     eax
+    sbb     eax, eax
+    ret
+
+; ---- 载入内置固件：调用“打开文件”处理函数 (esi = this) ----
+load_fw:
+    mov     ecx, esi
+    jmp     FN_OPEN_FILE
+
+; ---- OnInitDialog: 替换 0x40223A 处的 call 打开设备 (edi = this) ----
+hook_init:
+    mov     byte [G_INIT], 1
+    call    FN_OPEN_DEVICE
+    mov     byte [G_INIT], 0
+    cmp     word [cfg_title], 0
+    je      .post
+    push    cfg_title
+    push    dword [edi + 0x20]
+    call    [IAT_SetWindowTextW]
+.post:
+    push    0
+    push    KICK_ID
+    push    0x111                       ; WM_COMMAND
+    push    dword [edi + 0x20]
+    call    [IAT_PostMessageW]
+    ret
+
+; ---- WindowProc: 替换 0x402611 处转给基类的 call ----
+; ecx = edi = this, [esp+4] = msg, [esp+8] = wParam, [esp+12] = lParam
+hook_wndproc:
+    cmp     dword [esp + 4], 0x111      ; WM_COMMAND
+    jne     .pass
+    cmp     dword [esp + 8], KICK_ID
+    jne     .pass
+%ifdef SELFTEST
+    mov     dword [G_CHIP], 0x96FF00    ; 自测: 假装连着 BYC951，只载入固件
+    push    esi
+    mov     esi, edi
+    call    load_fw
+    pop     esi
+%else
+    cmp     byte [edi + 0x10E28], 0     ; 启动时设备已连接?
+    je      .pass
+    call    auto_ready
+    test    eax, eax
+    jz      .pass
+    push    esi
+    mov     esi, edi
+    call    load_fw
+    mov     ecx, edi
+    call    FN_ON_DOWNLOAD
+    pop     esi
+%endif
+    mov     ecx, edi
+.pass:
+    jmp     FN_BASE_WNDPROC
+
+; ---- 替换 0x40271F 处的 CFileDialog::DoModal: 直接返回 IDOK ----
+hook_domodal:
+    mov     eax, 1
+    ret
+
+; ---- 替换 0x402782 处的 CString 赋值: 改用内置固件的伪 CString ----
+; ecx = &this->path, [esp+4] = GetPathName 的结果（忽略）
+hook_assign:
+    push    fw_path                     ; 伪 CString 对象 = 指向数据的指针
+    mov     eax, esp
+    push    eax
+    call    FN_CSTR_ASSIGN
+    pop     ecx
+    ret     4
+
+; ---- 替换 call [CreateFileW]: 打开内置固件 ----
+hook_createfile:
+    push    fw_path
+    push    dword [esp + 8]             ; lpFileName
+    call    [IAT_lstrcmpW]
+    test    eax, eax
+    jnz     .real
+    call    open_fw
+    ret     28
+.real:
+    jmp     [IAT_CreateFileW]
+
+; ---- eax = 指向固件开头的 exe 自身句柄，失败为 -1 ----
+open_fw:
+    sub     esp, 0x410
+    mov     eax, esp
+    push    0x208
+    push    eax
+    push    0
+    call    [IAT_GetModuleFileNameW]
+    test    eax, eax
+    jz      .fail
+    cmp     eax, 0x208
+    jae     .fail
+    mov     eax, esp
+    push    0
+    push    0x80                        ; FILE_ATTRIBUTE_NORMAL
+    push    3                           ; OPEN_EXISTING
+    push    0
+    push    1                           ; FILE_SHARE_READ
+    push    0x80000000                  ; GENERIC_READ
+    push    eax
+    call    [IAT_CreateFileW]
+    cmp     eax, -1
+    je      .out
+    push    eax
+    push    2                           ; FILE_END
+    push    0
+    mov     ecx, [fw_len]
+    neg     ecx
+    push    ecx
+    push    eax
+    call    [IAT_SetFilePointer]
+    cmp     eax, -1
+    pop     eax
+    jne     .out
+    push    eax
+    call    [IAT_CloseHandle]
+.fail:
+    or      eax, -1
+.out:
+    add     esp, 0x410
+    ret
+
+%else
 ; ---- eax != 0: 已选烧录文件 且 勾选了“自动下载模式” (esi = this) ----
 auto_ready:
     mov     eax, [esi + 0x10E20]        ; 烧录文件路径 CString
@@ -266,12 +470,21 @@ save_state:
     pop     ecx
     leave
     ret
+%endif
 
 ; ---- 只读数据（紧跟在代码后面）----
     align   4, db 0xCC
 stub_data:
+%if UPGRADER
+cfg_magic:  db CFG_MAGIC_STR
+fw_len:     dd 0
+cfg_title:  times TITLE_CHARS dw 0
+fw_hdr:     dd 0, 0, 0, -1              ; 伪 CStringData: StringMgr, 长度, 容量, 引用(-1=锁定)
+fw_path:    times PATH_CHARS dw 0
+%else
 str_key:    dw REG_KEY_CHARS, 0
 str_value:  dw REG_VALUE_CHARS, 0
+%endif
 '''
 
 
@@ -279,9 +492,11 @@ def align(v, a):
     return (v + a - 1) & ~(a - 1)
 
 
-def assemble(stub_va, g_tick):
+def assemble(stub_va, g_tick, g_init=0, upgrader=False, selftest=False):
     """用 nasm 汇编桩代码，返回 (机器码, {标号: VA})。"""
-    defs = {'STUB_VA': stub_va, 'G_TICK': g_tick, 'CHK_ID': CHK_ID, 'SKIP_WINDOW_MS': SKIP_WINDOW_MS}
+    defs = {'STUB_VA': stub_va, 'G_TICK': g_tick, 'G_INIT': g_init, 'CHK_ID': CHK_ID,
+            'SKIP_WINDOW_MS': SKIP_WINDOW_MS, 'UPGRADER': int(upgrader), 'KICK_ID': KICK_ID,
+            'TITLE_CHARS': TITLE_CHARS, 'PATH_CHARS': PATH_CHARS}
     defs.update({k: v for k, v in globals().items() if k.startswith(('FN_', 'IAT_', 'G_'))})
     chars = lambda t: ', '.join(str(ord(c)) for c in t)
     with tempfile.TemporaryDirectory() as td:
@@ -292,6 +507,9 @@ def assemble(stub_va, g_tick):
                 f.write('%%define %s 0x%X\n' % (k, v))
             f.write('%%define REG_KEY_CHARS %s\n' % chars(REG_KEY))
             f.write('%%define REG_VALUE_CHARS %s\n' % chars(REG_VALUE))
+            f.write("%%define CFG_MAGIC_STR '%s'\n" % CFG_MAGIC.decode())
+            if selftest:
+                f.write('%define SELFTEST 1\n')
             f.write(STUB_ASM)
         subprocess.check_call(['nasm', '-f', 'bin', '-o', out, src])
         code = open(out, 'rb').read()
@@ -381,11 +599,92 @@ def build_dialog(old):
     return bytes(new)
 
 
-def main():
-    here = os.path.dirname(os.path.abspath(__file__))
-    src = sys.argv[1] if len(sys.argv) > 1 else os.path.join(here, '..', 'BootLoader_Tools_v3.5.7.1.exe')
-    dst = sys.argv[2] if len(sys.argv) > 2 else os.path.join(here, '..', 'BootLoader_Tools_v3.5.7.1_AutoDL.exe')
+def remove_relocs(blocks, rvas):
+    """删掉指定位置的 HIGHLOW 重定位项（被改写成 call rel32 的 call [IAT]）。"""
+    for rva in rvas:
+        page, ent = rva & ~0xFFF, (3 << 12) | (rva & 0xFFF)
+        for i, (p, ents) in enumerate(blocks):
+            if p == page:
+                assert ent in ents, '0x%X 处没有重定位' % rva
+                real = [e for e in ents if e >> 12 and e != ent]
+                blocks[i][1] = real + ([0] if len(real) % 2 else [])
+                break
+        else:
+            raise AssertionError('0x%X 处没有重定位' % rva)
+    blocks[:] = [b for b in blocks if any(e >> 12 for e in b[1])]
 
+
+def _sz(b, o):
+    if struct.unpack_from('<H', b, o)[0] == 0xFFFF:
+        return b[o:o + 4], o + 4
+    e = o
+    while struct.unpack_from('<H', b, e)[0]:
+        e += 2
+    return b[o:e + 2], e + 2
+
+
+def parse_dialog(b):
+    """DLGTEMPLATEEX -> (头部字段, [控件])，各字符串保留原始字节。"""
+    assert struct.unpack_from('<HH', b, 0) == (1, 0xFFFF)
+    d = {'fixed': bytearray(b[:26])}
+    o = 26
+    d['menu'], o = _sz(b, o)
+    d['cls'], o = _sz(b, o)
+    d['title'], o = _sz(b, o)
+    assert struct.unpack_from('<I', b, 12)[0] & 0x40           # DS_SETFONT
+    f, o2 = o + 6, o + 6
+    _, o2 = _sz(b, f)
+    d['font'] = b[o:o2]
+    o = o2
+    items = []
+    for _ in range(struct.unpack_from('<H', b, 16)[0]):
+        o = align(o, 4)
+        it = {'fixed': bytearray(b[o:o + 24])}
+        o += 24
+        it['cls'], o = _sz(b, o)
+        it['text'], o = _sz(b, o)
+        n = struct.unpack_from('<H', b, o)[0]
+        it['extra'] = b[o:o + 2 + n]
+        o += 2 + n
+        items.append(it)
+    assert o == len(b)
+    return d, items
+
+
+def serialize_dialog(d, items):
+    out = bytearray(d['fixed'])
+    struct.pack_into('<H', out, 16, len(items))
+    out += d['menu'] + d['cls'] + d['title'] + d['font']
+    for it in items:
+        out += b'\0' * (align(len(out), 4) - len(out))
+        out += it['fixed'] + it['cls'] + it['text'] + it['extra']
+    return bytes(out)
+
+
+def wz(text):
+    return text.encode('utf-16le') + b'\0\0'
+
+
+def build_dialog_upgrader(old):
+    """一键升级模板: 改标题、隐藏“打开文件”、底部加一行操作提示。"""
+    d, items = parse_dialog(old)
+    assert serialize_dialog(d, items) == old, '对话框模板往返不一致'
+    assert len(items) == 14 and struct.unpack_from('<h', d['fixed'], 24)[0] == 142
+    d['title'] = wz(UPG_DLG_TITLE)
+    struct.pack_into('<h', d['fixed'], 24, DLG_NEW_CY)
+    for it in items:
+        if struct.unpack_from('<I', it['fixed'], 20)[0] == 1003:       # “打开文件”
+            st = struct.unpack_from('<I', it['fixed'], 8)[0]
+            struct.pack_into('<I', it['fixed'], 8, st & ~0x10000000)   # 去掉 WS_VISIBLE
+            break
+    else:
+        raise AssertionError('没找到“打开文件”按钮')
+    hint = {'fixed': bytearray(struct.pack('<IIIhhhhI', 0, 0, 0x50020000, *CHK_RECT, 0xFFFFFFFF)),
+            'cls': struct.pack('<HH', 0xFFFF, 0x0082), 'text': wz(UPG_HINT), 'extra': b'\0\0'}
+    return serialize_dialog(d, items + [hint])
+
+
+def build(src, dst, upgrader=False, selftest=False):
     raw = open(src, 'rb').read()
     if hashlib.sha256(raw).hexdigest() != SRC_SHA256:
         sys.exit('输入文件不是预期的 BootLoader_Tools_v3.5.7.1.exe（SHA-256 不符）')
@@ -406,30 +705,48 @@ def main():
                 return n, rva - s.VirtualAddress
         raise ValueError(hex(rva))
 
-    # ---- 1. 变量: .data 末尾(未初始化区)借 4 字节 -------------------------
+    # ---- 1. 变量: .data 末尾(未初始化区)借几个字节 -------------------------
     data = sec['.data']
     g_tick_rva = align(data.VirtualAddress + data.Misc_VirtualSize, 4)
-    data_vsize = g_tick_rva + 4 - data.VirtualAddress
+    g_init_rva = g_tick_rva + 4
+    data_vsize = (g_init_rva + 4 if upgrader else g_tick_rva + 4) - data.VirtualAddress
     assert data_vsize <= align(data.Misc_VirtualSize, 0x1000)
-    g_tick = IMAGE_BASE + g_tick_rva
+    g_tick, g_init = IMAGE_BASE + g_tick_rva, IMAGE_BASE + g_init_rva
 
-    # ---- 2. 桩代码: 放在 .text 末尾到页边界之间的空隙 ----------------------
+    # ---- 2. 桩代码 ---------------------------------------------------------
+    #   自动下载版: 放在 .text 末尾到页边界之间的空隙
+    #   一键升级模板: 放进新增的 .upg 节（.text 的空隙放不下配置区）
     text = sec['.text']
-    stub_rva = align(text.VirtualAddress + text.Misc_VirtualSize, 16)
+    if upgrader:
+        stub_rva = align(last.VirtualAddress + last.Misc_VirtualSize, 0x1000)
+    else:
+        stub_rva = align(text.VirtualAddress + text.Misc_VirtualSize, 16)
     stub_va = IMAGE_BASE + stub_rva
-    code, labels = assemble(stub_va, g_tick)
-    code_len = labels['stub_data'] - stub_va     # 之后是字符串常量，不参与反汇编
+    code, labels = assemble(stub_va, g_tick, g_init, upgrader, selftest)
+    code_len = labels['stub_data'] - stub_va     # 之后是数据，不参与反汇编
     stub_end = stub_rva + len(code)
-    assert stub_end <= sec['.rdata'].VirtualAddress, '.text 空隙不够'
     t = body['.text']
-    assert not any(t[text.Misc_VirtualSize:]), '.text 尾部不是空的'
-    t += b'\0' * (align(stub_end - text.VirtualAddress, FILE_ALIGN) - len(t))
-    t[stub_rva - text.VirtualAddress:stub_end - text.VirtualAddress] = code
+    if upgrader:
+        cfg = labels['cfg_magic']
+        assert (labels['fw_len'], labels['cfg_title'], labels['fw_hdr'], labels['fw_path']) == \
+            (cfg + 8, cfg + 12, cfg + 12 + 2 * TITLE_CHARS, cfg + 28 + 2 * TITLE_CHARS), '配置区布局不对'
+        body['.upg'] = bytearray(code) + b'\0' * (align(len(code), FILE_ALIGN) - len(code))
+    else:
+        assert stub_end <= sec['.rdata'].VirtualAddress, '.text 空隙不够'
+        assert not any(t[text.Misc_VirtualSize:]), '.text 尾部不是空的'
+        t += b'\0' * (align(stub_end - text.VirtualAddress, FILE_ALIGN) - len(t))
+        t[stub_rva - text.VirtualAddress:stub_end - text.VirtualAddress] = code
 
-    for site, (old_target, label) in CALL_SITES.items():
+    call_sites = {**CALL_SITES, **(UPG_CALL_SITES if upgrader else {})}
+    iat_sites = UPG_IAT_SITES if upgrader else {}
+    for site, (old_target, label) in call_sites.items():
         o = site - IMAGE_BASE - text.VirtualAddress
         assert t[o] == 0xE8 and site + 5 + struct.unpack_from('<i', t, o + 1)[0] == old_target, hex(site)
         struct.pack_into('<i', t, o + 1, labels[label] - (site + 5))
+    for site, (iat, label) in iat_sites.items():
+        o = site - IMAGE_BASE - text.VirtualAddress
+        assert t[o:o + 2] == b'\xff\x15' and struct.unpack_from('<I', t, o + 2)[0] == iat, hex(site)
+        t[o:o + 6] = b'\xe8' + struct.pack('<i', labels[label] - (site + 5)) + b'\x90'
 
     # ---- 3. 重定位: 桩代码中的绝对地址 -------------------------------------
     reloc_dir = opt.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_BASERELOC']]
@@ -440,16 +757,19 @@ def main():
     blocks = parse_relocs(old_table)
     assert build_relocs(blocks) == old_table, '重定位表往返不一致'
     assert not any(r[reloc_dir.Size:]), '.reloc 尾部不是空的'
-    patched = set(a - IMAGE_BASE + i for a in CALL_SITES for i in range(1, 5))
+    remove_relocs(blocks, [a + 2 - IMAGE_BASE for a in iat_sites])
+    patched = set(a - IMAGE_BASE + i for a in list(call_sites) + list(iat_sites) for i in range(6))
     for page, ents in blocks:
         for e in ents:
             if e >> 12:
                 assert not {page + (e & 0xFFF) + i for i in range(4)} & patched, '被改写的 call 上有重定位'
-    new_relocs = [va - IMAGE_BASE for va in find_abs_relocs(code[:code_len], stub_va, opt.SizeOfImage)]
+    new_relocs = [va - IMAGE_BASE for va in find_abs_relocs(code[:code_len], stub_va,
+                                                                max(opt.SizeOfImage, stub_rva + align(len(code), 0x1000)))]
     add_relocs(blocks, new_relocs)
     new_table = build_relocs(blocks)
     assert len(new_table) <= reloc.Misc_VirtualSize and len(new_table) <= len(r)
     r[:len(new_table)] = new_table
+    r[len(new_table):] = b'\0' * (len(r) - len(new_table))
 
     # ---- 4. 资源: 新对话框模板追加到 .rsrc 末尾 ----------------------------
     rsrc = sec['.rsrc']
@@ -462,7 +782,8 @@ def main():
     assert entry is not None
     sname, soff = rva2sec(entry.OffsetToData)
     assert sname == '.rsrc'
-    dlg = build_dialog(bytes(body['.rsrc'][soff:soff + entry.Size]))
+    old_dlg = bytes(body['.rsrc'][soff:soff + entry.Size])
+    dlg = build_dialog_upgrader(old_dlg) if upgrader else build_dialog(old_dlg)
     dlg_off = align(rsrc.Misc_VirtualSize, 4)
     rsrc_vsize = dlg_off + len(dlg)
     assert rsrc_vsize <= reloc.VirtualAddress - rsrc.VirtualAddress, '.rsrc 空隙不够'
@@ -473,11 +794,14 @@ def main():
     struct.pack_into('<II', rs, ent_off, rsrc.VirtualAddress + dlg_off, len(dlg))
 
     # ---- 5. 重新排布文件并修正 PE 头 ---------------------------------------
+    names = list(body)
     new_ptr, off = {}, opt.SizeOfHeaders
-    for n in sec:
+    for n in names:
         new_ptr[n] = off
         off += len(body[n])
-    vsize = {'.text': stub_end - text.VirtualAddress, '.data': data_vsize, '.rsrc': rsrc_vsize}
+    vsize = {'.data': data_vsize, '.rsrc': rsrc_vsize}
+    if not upgrader:
+        vsize['.text'] = stub_end - text.VirtualAddress
     for n, s in sec.items():
         ho = s.get_file_offset()
         struct.pack_into('<I', hdr, ho + 8, vsize.get(n, s.Misc_VirtualSize))
@@ -485,7 +809,17 @@ def main():
         struct.pack_into('<I', hdr, ho + 20, new_ptr[n])
 
     oo = opt.get_file_offset()
-    struct.pack_into('<I', hdr, oo + 4, opt.SizeOfCode + len(body['.text']) - text.SizeOfRawData)
+    size_of_code = opt.SizeOfCode + len(body['.text']) - text.SizeOfRawData
+    if upgrader:
+        ho = last.get_file_offset() + 40
+        assert ho + 40 <= opt.SizeOfHeaders and not any(hdr[ho:ho + 40]), '节表后面没有空位'
+        hdr[ho:ho + 40] = struct.pack('<8sIIIIIIHHI', UPG_SECTION, len(code), stub_rva, len(body['.upg']),
+                                      new_ptr['.upg'], 0, 0, 0, 0, 0x60000020)   # CODE|EXECUTE|READ
+        fo = pe.FILE_HEADER.get_file_offset()
+        struct.pack_into('<H', hdr, fo + 2, pe.FILE_HEADER.NumberOfSections + 1)
+        struct.pack_into('<I', hdr, oo + 56, stub_rva + align(len(code), 0x1000))  # SizeOfImage
+        size_of_code += len(body['.upg'])
+    struct.pack_into('<I', hdr, oo + 4, size_of_code)
     struct.pack_into('<I', hdr, oo + 8, opt.SizeOfInitializedData + len(body['.rsrc']) - rsrc.SizeOfRawData)
     dd = {d.name: d for d in opt.DATA_DIRECTORY}
     struct.pack_into('<I', hdr, dd['IMAGE_DIRECTORY_ENTRY_RESOURCE'].get_file_offset() + 4, rsrc_vsize)
@@ -503,19 +837,36 @@ def main():
                     en, eo = k, eo - s.PointerToRawData
             struct.pack_into('<I', body[en], eo + 24, new_ptr[n] + o)
 
-    out = bytes(hdr) + b''.join(bytes(body[n]) for n in sec)
+    out = bytes(hdr) + b''.join(bytes(body[n]) for n in names)
     chk = pefile.PE(data=out)
     chk.OPTIONAL_HEADER.CheckSum = chk.generate_checksum()
     out = chk.write()
+    os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
     with open(dst, 'wb') as f:
         f.write(out)
 
     print('桩代码   : 0x%X..0x%X (代码 %d + 数据 %d 字节), 重定位 %d 处'
           % (stub_va, IMAGE_BASE + stub_end, code_len, len(code) - code_len, len(new_relocs)))
-    print('变量     : 0x%X' % g_tick)
+    print('变量     : 0x%X%s' % (g_tick, ', 0x%X' % g_init if upgrader else ''))
     print('对话框   : RVA 0x%X, %d 字节' % (rsrc.VirtualAddress + dlg_off, len(dlg)))
     print('输出     : %s (%d 字节)' % (os.path.normpath(dst), len(out)))
     print('SHA-256  : %s' % hashlib.sha256(out).hexdigest())
+    return labels
+
+
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    ap = argparse.ArgumentParser(description='生成自动下载版或一键升级模板')
+    ap.add_argument('--upgrader', action='store_true', help='生成一键升级程序模板')
+    ap.add_argument('--selftest', action='store_true', help=argparse.SUPPRESS)
+    ap.add_argument('src', nargs='?', default=os.path.join(here, '..', 'BootLoader_Tools_v3.5.7.1.exe'))
+    ap.add_argument('dst', nargs='?')
+    a = ap.parse_args()
+    if a.selftest and not a.upgrader:
+        ap.error('--selftest 只用于 --upgrader')
+    dst = a.dst or os.path.join(here, '..', *(('upgrader', 'Upgrader_Template.exe') if a.upgrader
+                                              else ('BootLoader_Tools_v3.5.7.1_AutoDL.exe',)))
+    build(a.src, dst, a.upgrader, a.selftest)
 
 
 if __name__ == '__main__':
