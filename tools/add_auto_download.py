@@ -56,7 +56,7 @@
     “下载程序”里调用下载流程(0x404B2F)后状态不是 5，或跳转 APP(0x404B6C)后状态不是 2。
     点“重试”: 设备还连着就重新载入固件并下载，已拔出就显示“请插入USB设备”。
     重新下载、设备拔出或接入时恢复正常显示。
-   程序图标换成 upgrader/upgrader_icon.ico（资源目录整体重建到新增的 .rsrc2 节，
+   程序图标换成 upgrader/upgrader_icon.ico（资源目录整体重建到新增的 .rsrc 节，原节改名 .oldrsrc，
    用的是 upgrader/make_upgrader.py 里的 set_icon，生成升级程序时还可以再换）。
 10. 升级成功后自动退出（配置区选项 CFG_AUTO_EXIT）：“下载程序”流程里跳转 APP 成功
     (0x404B6C) 时显示“升级成功”，启动一个 EXIT_DELAY_MS 的定时器；定时器到点后

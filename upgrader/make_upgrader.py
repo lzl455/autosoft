@@ -45,10 +45,13 @@ def pe_checksum(data, csum_off):
 
 
 # ---------------------------------------------------------------------------
-# 图标：重建整个资源目录，放进文件最后一个节 .rsrc2
+# 图标：重建整个资源目录，放进文件最后新增的 .rsrc 节；原来的 .rsrc 节改名为 .oldrsrc
+# （有的工具按节名而不是数据目录找资源，两边必须一致，否则会显示旧图标）
 # ---------------------------------------------------------------------------
 RT_ICON, RT_GROUP_ICON = 3, 14
-RSRC_SECTION = b'.rsrc2\0\0'
+RSRC_SECTION = b'.rsrc\0\0\0'
+OLD_RSRC_SECTION = b'.oldrsrc'
+LEGACY_RSRC_SECTION = b'.rsrc2\0\0'      # 旧版模板用过的节名
 
 
 def _u16(b, o):
@@ -224,14 +227,19 @@ def set_icon(exe, icon_blob, label='图标'):
     tree[RT_GROUP_ICON] = dict(groups)
     tree[RT_GROUP_ICON][gname] = {lang: (grp, 0)}
 
-    # 去掉上次放进去的 .rsrc2，再放一个新的
+    # 去掉上次放进去的资源节，再放一个新的；第一次则把原来的 .rsrc 改名
+    names = [s['name'] for s in L['secs']]
+    ours = last['name'] == LEGACY_RSRC_SECTION or (last['name'] == RSRC_SECTION and OLD_RSRC_SECTION in names)
     old_raw = 0
-    if last['name'] == RSRC_SECTION:
+    if ours:
         del exe[last['ptr']:]
         exe[last['hdr']:last['hdr'] + 40] = bytes(40)
         old_raw = last['raw']
         L['secs'].pop()
         last = L['secs'][-1]
+    for s in L['secs']:
+        if s['name'] == RSRC_SECTION:
+            exe[s['hdr']:s['hdr'] + 8] = OLD_RSRC_SECTION
     hdr = L['opt'] + L['optsz'] + 40 * len(L['secs'])
     if hdr + 40 > L['hdr_size'] or any(exe[hdr:hdr + 40]):
         raise SystemExit('节表没有空位')
