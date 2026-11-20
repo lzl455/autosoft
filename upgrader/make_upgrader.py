@@ -72,36 +72,68 @@ def build(template, fw, title, name):
     return bytes(exe)
 
 
-def main():
-    here = os.path.dirname(os.path.abspath(__file__))
-    ap = argparse.ArgumentParser(description='把固件 .bin 做成双击即可升级的 exe')
-    ap.add_argument('bin', help='固件 .bin 文件')
-    ap.add_argument('-o', '--output', help='输出 exe（默认: 与 .bin 同目录，<名称>_升级.exe）')
-    ap.add_argument('--title', help='窗口标题（默认: 固件升级 - <文件名>）')
-    ap.add_argument('--template', default=os.path.join(here, 'Upgrader_Template.exe'), help='模板 exe')
-    a = ap.parse_args()
-
-    name = os.path.basename(a.bin)
+def make_one(path, output, title, template):
+    name = os.path.basename(path)
     stem = os.path.splitext(name)[0]
-    out = a.output or os.path.join(os.path.dirname(os.path.abspath(a.bin)), stem + '_升级.exe')
-    title = a.title if a.title is not None else '固件升级 - ' + name
-    with open(a.template, 'rb') as f:
-        template = f.read()
-    with open(a.bin, 'rb') as f:
+    out = output or os.path.join(os.path.dirname(os.path.abspath(path)), stem + '_升级.exe')
+    title = title if title is not None else '固件升级 - ' + name
+    with open(path, 'rb') as f:
         fw = f.read()
     exe = build(template, fw, title, name)
     with open(out, 'wb') as f:
         f.write(exe)
-    print('固件     : %s (%d 字节)' % (a.bin, len(fw)))
+    print('固件     : %s (%d 字节)' % (path, len(fw)))
     print('窗口标题 : %s' % title[:TITLE_CHARS - 1])
     print('已生成   : %s' % out)
 
 
-if __name__ == '__main__':
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    ap = argparse.ArgumentParser(description='把固件 .bin 做成双击即可升级的 exe')
+    ap.add_argument('bin', nargs='*', help='固件 .bin 文件（可以一次给多个）')
+    ap.add_argument('-o', '--output', help='输出 exe（只给一个 .bin 时可用；默认: 与 .bin 同目录，<名称>_升级.exe）')
+    ap.add_argument('--title', help='窗口标题（默认: 固件升级 - <文件名>）')
+    ap.add_argument('--template', default=os.path.join(here, 'Upgrader_Template.exe'), help='模板 exe')
+    ap.add_argument('--pause', action='store_true', help='结束前等待按回车（供 make_upgrader.bat 使用）')
+    a = ap.parse_args()
+
+    failed = 0
     try:
-        main()
-    except SystemExit as e:
-        if e.code not in (0, None) and not isinstance(e.code, int):
-            print('错误: %s' % e.code, file=sys.stderr)
-            sys.exit(1)
-        raise
+        if not a.bin:
+            print('用法: 把固件 .bin 文件拖到 make_upgrader.bat 上（可以一次拖多个），')
+            print('      会在 .bin 旁边生成 <名称>_升级.exe。')
+            failed = 1
+        elif a.output and len(a.bin) > 1:
+            print('错误: 一次给多个 .bin 时不能用 -o')
+            failed = 1
+        else:
+            with open(a.template, 'rb') as f:
+                template = f.read()
+            for path in a.bin:
+                print()
+                try:
+                    make_one(path, a.output, a.title, template)
+                except SystemExit as e:
+                    print('错误: %s（%s）' % (e.code, path))
+                    failed += 1
+                except OSError as e:
+                    print('错误: %s' % e)
+                    failed += 1
+    except OSError as e:
+        print('错误: 读不到模板 %s（%s）' % (a.template, e.strerror or e))
+        failed = 1
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        failed = 1
+    if a.pause:
+        print()
+        try:
+            input('按回车键关闭窗口...')
+        except EOFError:
+            pass
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == '__main__':
+    main()

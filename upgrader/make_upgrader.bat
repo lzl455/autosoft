@@ -1,15 +1,15 @@
 @echo off
-chcp 65001 >nul
-rem 把固件 .bin 拖到本文件上，即可在 .bin 旁边生成 <名称>_升级.exe
-if "%~1"=="" (
-  echo 请把固件 .bin 文件拖到 make_upgrader.bat 上。
-  pause
-  exit /b 1
-)
-:next
-if "%~1"=="" goto done
-python "%~dp0make_upgrader.py" "%~1"
-shift
-goto next
-:done
+rem Drag one or more firmware .bin files onto this file.
+rem Keep this file pure ASCII: no chcp, no non-ASCII text (cmd misreads them and closes).
+setlocal
+set "PY="
+py -3 -c "" >nul 2>nul && set "PY=py -3"
+if not defined PY python -c "" >nul 2>nul && set "PY=python"
+if not defined PY goto nopython
+%PY% "%~dp0make_upgrader.py" --pause %*
+exit /b
+:nopython
+echo Python 3 was not found.
+echo Install it from https://www.python.org/downloads/ and tick "Add python.exe to PATH".
 pause
+exit /b 1

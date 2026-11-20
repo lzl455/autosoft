@@ -33,9 +33,10 @@
 
 ## 一键升级程序（把 .bin 做成双击即可升级的 exe）
 
-生成（需要 Windows 上装有 Python 3，只用标准库）：
+生成（需要 Windows 上装有 Python 3，安装时勾选“Add python.exe to PATH”；只用标准库）：
 
-- 把固件 `.bin` 拖到 `upgrader/make_upgrader.bat` 上，会在 `.bin` 旁边生成 `<名称>_升级.exe`；或者
+- 把固件 `.bin` 拖到 `upgrader/make_upgrader.bat` 上（可以一次拖多个），会在 `.bin` 旁边生成
+  `<名称>_升级.exe`。窗口会停住显示结果，按回车关闭；没装 Python 时也会提示。或者
 - 命令行：
 
 ```bash
