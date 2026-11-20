@@ -4,13 +4,14 @@
 把固件 .bin 装进 Upgrader_Template.exe，生成可以直接双击使用的一键升级程序。
 
 用法:
-    python make_upgrader.py 固件.bin [-o 输出.exe] [--title 窗口标题] [--template 模板.exe]
+    python make_upgrader.py 固件.bin [-o 输出.exe] [--title 窗口标题] [--no-exit] [--template 模板.exe]
 
 也可以把 .bin 文件直接拖到 make_upgrader.bat 上。
 
 只用到 Python 标准库（Python 3.6 及以上），不需要安装其它东西。
 
-生成的 exe = 模板 + 配置区（固件长度、标题、固件名）+ 文件末尾附加的固件。
+生成的 exe = 模板 + 配置区（固件长度、选项、标题、固件名）+ 文件末尾附加的固件。
+默认升级成功 3 秒后自动退出；加 --no-exit 则保持打开，可以连续升级多台。
 升级程序运行时以只读方式打开自身，从“文件末尾 - 固件长度”处读出固件，
 交给原程序照常解析、下载、校验。
 """
@@ -19,7 +20,8 @@ import os
 import struct
 import sys
 
-CFG_MAGIC = b'BYCFWCF1'      # 与 tools/add_auto_download.py 保持一致
+CFG_MAGIC = b'BYCFWCF2'      # 与 tools/add_auto_download.py 保持一致
+CFG_AUTO_EXIT = 1
 TITLE_CHARS = 96             # 含结尾 0
 PATH_CHARS = 128             # 含结尾 0
 PATH_PREFIX = '内置固件\\'
@@ -40,11 +42,13 @@ def pe_checksum(data, csum_off):
     return s + len(data)
 
 
-def build(template, fw, title, name):
+def build(template, fw, title, name, auto_exit=True):
     exe = bytearray(template)
     if exe[:2] != b'MZ':
         raise SystemExit('模板不是 exe 文件')
     pos = exe.find(CFG_MAGIC)
+    if pos < 0 and exe.find(b'BYCFWCF') >= 0:
+        raise SystemExit('模板版本与本脚本不符，请使用同一目录下的 Upgrader_Template.exe')
     if pos < 0 or exe.find(CFG_MAGIC, pos + 1) >= 0:
         raise SystemExit('模板里找不到唯一的配置区，请使用 Upgrader_Template.exe')
     if struct.unpack_from('<I', exe, pos + 8)[0] != 0:
@@ -57,10 +61,11 @@ def build(template, fw, title, name):
         raise SystemExit('固件文件名太长（最多 %d 个字符）' % (PATH_CHARS - 1 - len(PATH_PREFIX)))
     title = title[:TITLE_CHARS - 1]
 
-    o_title = pos + 12
+    o_title = pos + 16
     o_hdr = o_title + 2 * TITLE_CHARS
     o_path = o_hdr + 16
     struct.pack_into('<I', exe, pos + 8, len(fw))
+    struct.pack_into('<I', exe, pos + 12, CFG_AUTO_EXIT if auto_exit else 0)
     exe[o_title:o_title + 2 * TITLE_CHARS] = title.encode('utf-16le').ljust(2 * TITLE_CHARS, b'\0')
     struct.pack_into('<IIIi', exe, o_hdr, 0, len(path), PATH_CHARS - 1, -1)
     exe[o_path:o_path + 2 * PATH_CHARS] = path.encode('utf-16le').ljust(2 * PATH_CHARS, b'\0')
@@ -72,18 +77,19 @@ def build(template, fw, title, name):
     return bytes(exe)
 
 
-def make_one(path, output, title, template):
+def make_one(path, output, title, template, auto_exit):
     name = os.path.basename(path)
     stem = os.path.splitext(name)[0]
     out = output or os.path.join(os.path.dirname(os.path.abspath(path)), stem + '_升级.exe')
     title = title if title is not None else '固件升级 - ' + name
     with open(path, 'rb') as f:
         fw = f.read()
-    exe = build(template, fw, title, name)
+    exe = build(template, fw, title, name, auto_exit)
     with open(out, 'wb') as f:
         f.write(exe)
     print('固件     : %s (%d 字节)' % (path, len(fw)))
     print('窗口标题 : %s' % title[:TITLE_CHARS - 1])
+    print('升级成功 : %s' % ('3 秒后自动退出' if auto_exit else '保持打开，可连续升级'))
     print('已生成   : %s' % out)
 
 
@@ -93,6 +99,7 @@ def main():
     ap.add_argument('bin', nargs='*', help='固件 .bin 文件（可以一次给多个）')
     ap.add_argument('-o', '--output', help='输出 exe（只给一个 .bin 时可用；默认: 与 .bin 同目录，<名称>_升级.exe）')
     ap.add_argument('--title', help='窗口标题（默认: 固件升级 - <文件名>）')
+    ap.add_argument('--no-exit', action='store_true', help='升级成功后不自动退出（连续升级多台时用）')
     ap.add_argument('--template', default=os.path.join(here, 'Upgrader_Template.exe'), help='模板 exe')
     ap.add_argument('--pause', action='store_true', help='结束前等待按回车（供 make_upgrader.bat 使用）')
     a = ap.parse_args()
@@ -112,7 +119,7 @@ def main():
             for path in a.bin:
                 print()
                 try:
-                    make_one(path, a.output, a.title, template)
+                    make_one(path, a.output, a.title, template, not a.no_exit)
                 except SystemExit as e:
                     print('错误: %s（%s）' % (e.code, path))
                     failed += 1

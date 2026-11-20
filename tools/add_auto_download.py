@@ -30,7 +30,7 @@
 
 一键升级模板（--upgrader）在上面 1~3 的基础上：
 5. 固件附加在 exe 文件末尾（由 make_upgrader.py 写入），模板里留有一块以
-   CFG_MAGIC 开头的配置区：固件长度、窗口标题、伪造的 CString（内容为
+   CFG_MAGIC 开头的配置区：固件长度、选项、窗口标题、伪造的 CString（内容为
    “内置固件\\<文件名>”）。
 6. “打开文件”处理函数(0x4026B0)里：CFileDialog::DoModal 直接返回 IDOK；
    给烧录文件路径赋值时换成上面的伪造 CString。于是原程序照常解析固件、
@@ -42,6 +42,9 @@
    启动时已经连着的设备：OnInitDialog 结束后投递一条 WM_COMMAND(KICK_ID)，
    在消息循环里载入固件并开始下载（避免在窗口显示之前就开始烧录）。
 9. 对话框隐藏“打开文件”按钮，复选框换成操作提示，标题改为配置区里的标题。
+10. 升级成功后自动退出（配置区选项 CFG_AUTO_EXIT）：“下载程序”流程里跳转 APP 成功
+    (0x404B6C) 时把标题改成提示，启动一个 EXIT_DELAY_MS 的定时器；定时器到点后
+    投递 WM_COMMAND(IDCANCEL)，与点“退出”相同。“读取程序”后的跳转(0x404212)不触发。
 
 原程序里与本补丁有关的内容（逆向所得）
     0x56E0A4  DWORD 状态机: 0 空闲 / 3 等待进BOOT后下载 / 6 等待进BOOT后读取
@@ -105,6 +108,8 @@ IAT_GetModuleFileNameW = 0x51E2A8
 IAT_SetFilePointer = 0x51E3D0
 IAT_SetWindowTextW = 0x51E6C0
 IAT_PostMessageW = 0x51E830
+IAT_SetTimer = 0x51E5E8
+IAT_KillTimer = 0x51E5E4
 
 # 被改写的 call 指令（均为 E8 rel32，不带重定位）: 地址 -> (原目标, 新目标标号)
 CALL_SITES = {
@@ -117,6 +122,7 @@ CALL_SITES = {
 }
 # 一键升级模板额外改写的 call（E8 rel32）
 UPG_CALL_SITES = {
+    0x404B6C: (FN_JUMP_APP, 'hook_jump_dl'),        # 下载成功后跳转 APP -> 自动退出
     0x40271F: (FN_FILE_DOMODAL, 'hook_domodal'),    # 不弹选择文件对话框
     0x402782: (FN_CSTR_ASSIGN, 'hook_assign'),      # 路径 = “内置固件\<名称>”
 }
@@ -140,9 +146,13 @@ REG_VALUE = 'AutoDownload'
 # 一键升级模板
 KICK_ID = 1051                        # 启动后投递的 WM_COMMAND id
 UPG_DLG_TITLE = '固件升级工具'         # 资源里的标题（配置区标题为空时显示）
-UPG_HINT = '插入设备即自动升级，提示“程序更新成功！”后拔出换下一台'
+UPG_HINT = '插入设备即自动升级，请等待提示“程序更新成功！”'
+UPG_DONE_TITLE = '升级成功，3 秒后自动退出'
+EXIT_TIMER_ID = 0xB1C5
+EXIT_DELAY_MS = 3000
+CFG_AUTO_EXIT = 1                     # 配置区选项位: 升级成功后自动退出
 UPG_SECTION = b'.upg'
-CFG_MAGIC = b'BYCFWCF1'               # 配置区: magic(8) 固件长度(4) 标题 CString头(16) 路径
+CFG_MAGIC = b'BYCFWCF2'               # 配置区: magic(8) 固件长度(4) 选项(4) 标题 CString头(16) 路径
 TITLE_CHARS = 96                      # 含结尾 0
 PATH_CHARS = 128                      # 含结尾 0
 PATH_PREFIX = '内置固件\\'
@@ -257,6 +267,21 @@ hook_init:
 ; ---- WindowProc: 替换 0x402611 处转给基类的 call ----
 ; ecx = edi = this, [esp+4] = msg, [esp+8] = wParam, [esp+12] = lParam
 hook_wndproc:
+    cmp     dword [esp + 4], 0x113      ; WM_TIMER
+    jne     .cmd
+    cmp     dword [esp + 8], EXIT_TIMER_ID
+    jne     .pass
+    push    EXIT_TIMER_ID
+    push    dword [edi + 0x20]
+    call    [IAT_KillTimer]
+    push    0
+    push    2                           ; IDCANCEL = 点“退出”
+    push    0x111
+    push    dword [edi + 0x20]
+    call    [IAT_PostMessageW]
+    mov     ecx, edi
+    jmp     .pass
+.cmd:
     cmp     dword [esp + 4], 0x111      ; WM_COMMAND
     jne     .pass
     cmp     dword [esp + 8], KICK_ID
@@ -283,6 +308,24 @@ hook_wndproc:
     mov     ecx, edi
 .pass:
     jmp     FN_BASE_WNDPROC
+
+; ---- 替换 0x404B6C 处的跳转 APP（只在“下载程序”流程里, esi = this）----
+hook_jump_dl:
+    call    hook_jump
+    cmp     dword [G_STATE], 2          ; 跳转成功 = 升级成功
+    jne     .done
+    test    byte [cfg_flags], CFG_AUTO_EXIT
+    jz      .done
+    push    str_done_title
+    push    dword [esi + 0x20]
+    call    [IAT_SetWindowTextW]
+    push    0
+    push    EXIT_DELAY_MS
+    push    EXIT_TIMER_ID
+    push    dword [esi + 0x20]
+    call    [IAT_SetTimer]
+.done:
+    ret
 
 ; ---- 替换 0x40271F 处的 CFileDialog::DoModal: 直接返回 IDOK ----
 hook_domodal:
@@ -478,9 +521,11 @@ stub_data:
 %if UPGRADER
 cfg_magic:  db CFG_MAGIC_STR
 fw_len:     dd 0
+cfg_flags:  dd 0
 cfg_title:  times TITLE_CHARS dw 0
 fw_hdr:     dd 0, 0, 0, -1              ; 伪 CStringData: StringMgr, 长度, 容量, 引用(-1=锁定)
 fw_path:    times PATH_CHARS dw 0
+str_done_title: dw DONE_TITLE_CHARS, 0
 %else
 str_key:    dw REG_KEY_CHARS, 0
 str_value:  dw REG_VALUE_CHARS, 0
@@ -496,7 +541,8 @@ def assemble(stub_va, g_tick, g_init=0, upgrader=False, selftest=False):
     """用 nasm 汇编桩代码，返回 (机器码, {标号: VA})。"""
     defs = {'STUB_VA': stub_va, 'G_TICK': g_tick, 'G_INIT': g_init, 'CHK_ID': CHK_ID,
             'SKIP_WINDOW_MS': SKIP_WINDOW_MS, 'UPGRADER': int(upgrader), 'KICK_ID': KICK_ID,
-            'TITLE_CHARS': TITLE_CHARS, 'PATH_CHARS': PATH_CHARS}
+            'TITLE_CHARS': TITLE_CHARS, 'PATH_CHARS': PATH_CHARS, 'CFG_AUTO_EXIT': CFG_AUTO_EXIT,
+            'EXIT_TIMER_ID': EXIT_TIMER_ID, 'EXIT_DELAY_MS': EXIT_DELAY_MS}
     defs.update({k: v for k, v in globals().items() if k.startswith(('FN_', 'IAT_', 'G_'))})
     chars = lambda t: ', '.join(str(ord(c)) for c in t)
     with tempfile.TemporaryDirectory() as td:
@@ -508,6 +554,7 @@ def assemble(stub_va, g_tick, g_init=0, upgrader=False, selftest=False):
             f.write('%%define REG_KEY_CHARS %s\n' % chars(REG_KEY))
             f.write('%%define REG_VALUE_CHARS %s\n' % chars(REG_VALUE))
             f.write("%%define CFG_MAGIC_STR '%s'\n" % CFG_MAGIC.decode())
+            f.write('%%define DONE_TITLE_CHARS %s\n' % chars(UPG_DONE_TITLE))
             if selftest:
                 f.write('%define SELFTEST 1\n')
             f.write(STUB_ASM)
@@ -728,8 +775,8 @@ def build(src, dst, upgrader=False, selftest=False):
     t = body['.text']
     if upgrader:
         cfg = labels['cfg_magic']
-        assert (labels['fw_len'], labels['cfg_title'], labels['fw_hdr'], labels['fw_path']) == \
-            (cfg + 8, cfg + 12, cfg + 12 + 2 * TITLE_CHARS, cfg + 28 + 2 * TITLE_CHARS), '配置区布局不对'
+        assert (labels['fw_len'], labels['cfg_flags'], labels['cfg_title'], labels['fw_hdr'], labels['fw_path']) == \
+            (cfg + 8, cfg + 12, cfg + 16, cfg + 16 + 2 * TITLE_CHARS, cfg + 32 + 2 * TITLE_CHARS), '配置区布局不对'
         body['.upg'] = bytearray(code) + b'\0' * (align(len(code), FILE_ALIGN) - len(code))
     else:
         assert stub_end <= sec['.rdata'].VirtualAddress, '.text 空隙不够'
