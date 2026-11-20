@@ -41,7 +41,10 @@
 8. 不再需要复选框，自动下载始终开启；设备接入时先载入内置固件再开始下载。
    启动时已经连着的设备：OnInitDialog 结束后投递一条 WM_COMMAND(KICK_ID)，
    在消息循环里载入固件并开始下载（避免在窗口显示之前就开始烧录）。
-9. 对话框隐藏“打开文件”按钮，复选框换成操作提示，标题改为配置区里的标题。
+9. 精简界面：对话框加宽变矮，只留进度条、右侧百分比、下面一行操作信息和连接状态，
+   其余控件隐藏（仍在，原程序照常读写）；加上标题栏关闭按钮；标题改为配置区里的标题。
+   百分比：设置进度条位置的 5 处 SendMessageW(PBM_SETPOS) 换成钩子，发完后把
+   位置写到百分比标签并立即重绘（下载时原程序不跑消息循环）。
    程序图标换成 upgrader/upgrader_icon.ico（资源目录整体重建到新增的 .rsrc2 节，
    用的是 upgrader/make_upgrader.py 里的 set_icon，生成升级程序时还可以再换）。
 10. 升级成功后自动退出（配置区选项 CFG_AUTO_EXIT）：“下载程序”流程里跳转 APP 成功
@@ -110,6 +113,9 @@ IAT_GetModuleFileNameW = 0x51E2A8
 IAT_SetFilePointer = 0x51E3D0
 IAT_SetWindowTextW = 0x51E6C0
 IAT_PostMessageW = 0x51E830
+IAT_SendMessageW = 0x51E844
+IAT_GetDlgItem = 0x51E754
+IAT_UpdateWindow = 0x51E84C
 IAT_SetTimer = 0x51E5E8
 IAT_KillTimer = 0x51E5E4
 
@@ -133,6 +139,11 @@ UPG_IAT_SITES = {
     0x4027C1: (IAT_CreateFileW, 'hook_createfile'),
     0x402ADB: (IAT_CreateFileW, 'hook_createfile'),
     0x403411: (IAT_CreateFileW, 'hook_createfile'),
+    0x403168: (IAT_SendMessageW, 'hook_setpos'),    # 进度条 PBM_SETPOS
+    0x40321C: (IAT_SendMessageW, 'hook_setpos'),
+    0x403E8F: (IAT_SendMessageW, 'hook_setpos'),
+    0x4040D3: (IAT_SendMessageW, 'hook_setpos'),
+    0x404A1F: (IAT_SendMessageW, 'hook_setpos'),
 }
 
 # ---- 新增内容 --------------------------------------------------------------
@@ -148,7 +159,14 @@ REG_VALUE = 'AutoDownload'
 # 一键升级模板
 KICK_ID = 1051                        # 启动后投递的 WM_COMMAND id
 UPG_DLG_TITLE = '固件升级工具'         # 资源里的标题（配置区标题为空时显示）
-UPG_HINT = '插入设备即自动升级，请等待提示“程序更新成功！”'
+PCT_ID = 1052                         # 百分比标签
+UPG_DLG_SIZE = (300, 48)              # 精简后的对话框大小 (DLU)
+UPG_LAYOUT = {                        # 留下的控件: 识别方式 -> (x, y, cx, cy)
+    1007: (8, 10, 250, 16),           # 进度条
+    1038: (8, 31, 190, 12),           # 操作信息（彩色：下载中/成功/失败原因）
+    '设备未连接': (200, 31, 92, 12),   # 连接状态（右对齐）
+}
+PCT_RECT = (262, 13, 30, 10)
 UPG_DONE_TITLE = '升级成功，3 秒后自动退出'
 EXIT_TIMER_ID = 0xB1C5
 EXIT_DELAY_MS = 3000
@@ -250,6 +268,8 @@ load_fw:
 
 ; ---- OnInitDialog: 替换 0x40223A 处的 call 打开设备 (edi = this) ----
 hook_init:
+    mov     eax, [edi + 0x20]
+    mov     [G_HWND], eax
     mov     byte [G_INIT], 1
     call    FN_OPEN_DEVICE
     mov     byte [G_INIT], 0
@@ -327,6 +347,63 @@ hook_jump_dl:
     push    dword [esi + 0x20]
     call    [IAT_SetTimer]
 .done:
+    ret
+
+; ---- 替换设置进度条位置的 call [SendMessageW]: 同时更新百分比标签 ----
+hook_setpos:
+    push    dword [esp + 16]
+    push    dword [esp + 16]
+    push    dword [esp + 16]
+    push    dword [esp + 16]
+    call    [IAT_SendMessageW]
+    push    eax
+    cmp     dword [esp + 12], 0x402     ; PBM_SETPOS
+    jne     .ret
+    mov     eax, [esp + 16]             ; 位置 0~100
+    call    show_percent
+.ret:
+    pop     eax
+    ret     16
+
+; ---- eax = 百分比，写到 PCT_ID 标签并立即重绘 ----
+show_percent:
+    push    ebx
+    mov     ebx, G_PCTBUF
+    mov     ecx, 10
+    cmp     eax, 100
+    jb      .lt100
+    mov     dword [ebx], 0x00300031     ; "10"
+    mov     dword [ebx + 4], 0x00250030 ; "0%"
+    mov     word [ebx + 8], 0
+    jmp     .set
+.lt100:
+    cmp     eax, 10
+    jb      .one
+    xor     edx, edx
+    div     ecx
+    add     eax, '0'
+    mov     [ebx], ax
+    add     edx, '0'
+    mov     [ebx + 2], dx
+    mov     dword [ebx + 4], '%'
+    jmp     .set
+.one:
+    add     eax, '0'
+    mov     [ebx], ax
+    mov     dword [ebx + 2], '%'
+.set:
+    push    PCT_ID
+    push    dword [G_HWND]
+    call    [IAT_GetDlgItem]
+    test    eax, eax
+    jz      .out
+    push    eax                         ; UpdateWindow 的参数
+    push    ebx
+    push    eax
+    call    [IAT_SetWindowTextW]
+    call    [IAT_UpdateWindow]
+.out:
+    pop     ebx
     ret
 
 ; ---- 替换 0x40271F 处的 CFileDialog::DoModal: 直接返回 IDOK ----
@@ -540,12 +617,14 @@ def align(v, a):
 
 
 def assemble(stub_va, g_tick, g_init=0, upgrader=False, selftest=False):
+    g_hwnd, g_pctbuf = g_init + 4, g_init + 8
     """用 nasm 汇编桩代码，返回 (机器码, {标号: VA})。"""
     defs = {'STUB_VA': stub_va, 'G_TICK': g_tick, 'G_INIT': g_init, 'CHK_ID': CHK_ID,
             'SKIP_WINDOW_MS': SKIP_WINDOW_MS, 'UPGRADER': int(upgrader), 'KICK_ID': KICK_ID,
             'TITLE_CHARS': TITLE_CHARS, 'PATH_CHARS': PATH_CHARS, 'CFG_AUTO_EXIT': CFG_AUTO_EXIT,
-            'EXIT_TIMER_ID': EXIT_TIMER_ID, 'EXIT_DELAY_MS': EXIT_DELAY_MS}
-    defs.update({k: v for k, v in globals().items() if k.startswith(('FN_', 'IAT_', 'G_'))})
+            'EXIT_TIMER_ID': EXIT_TIMER_ID, 'EXIT_DELAY_MS': EXIT_DELAY_MS,
+            'G_HWND': g_hwnd, 'G_PCTBUF': g_pctbuf, 'PCT_ID': PCT_ID}
+    defs.update({k: v for k, v in globals().items() if k.startswith(('FN_', 'IAT_', 'G_')) and k not in defs})
     chars = lambda t: ', '.join(str(ord(c)) for c in t)
     with tempfile.TemporaryDirectory() as td:
         src, out, mapf = (os.path.join(td, n) for n in ('stub.asm', 'stub.bin', 'stub.map'))
@@ -715,22 +794,27 @@ def wz(text):
 
 
 def build_dialog_upgrader(old):
-    """一键升级模板: 改标题、隐藏“打开文件”、底部加一行操作提示。"""
+    """一键升级模板: 加宽变矮，只留进度条 + 百分比 + 一行状态，其余隐藏；加关闭按钮。"""
     d, items = parse_dialog(old)
     assert serialize_dialog(d, items) == old, '对话框模板往返不一致'
     assert len(items) == 14 and struct.unpack_from('<h', d['fixed'], 24)[0] == 142
     d['title'] = wz(UPG_DLG_TITLE)
-    struct.pack_into('<h', d['fixed'], 24, DLG_NEW_CY)
+    struct.pack_into('<I', d['fixed'], 12, struct.unpack_from('<I', d['fixed'], 12)[0] | 0x00080000)  # WS_SYSMENU
+    struct.pack_into('<hh', d['fixed'], 22, *UPG_DLG_SIZE)
+    kept = set()
     for it in items:
-        if struct.unpack_from('<I', it['fixed'], 20)[0] == 1003:       # “打开文件”
-            st = struct.unpack_from('<I', it['fixed'], 8)[0]
-            struct.pack_into('<I', it['fixed'], 8, st & ~0x10000000)   # 去掉 WS_VISIBLE
-            break
-    else:
-        raise AssertionError('没找到“打开文件”按钮')
-    hint = {'fixed': bytearray(struct.pack('<IIIhhhhI', 0, 0, 0x50020000, *CHK_RECT, 0xFFFFFFFF)),
-            'cls': struct.pack('<HH', 0xFFFF, 0x0082), 'text': wz(UPG_HINT), 'extra': b'\0\0'}
-    return serialize_dialog(d, items + [hint])
+        cid = struct.unpack_from('<I', it['fixed'], 20)[0]
+        key = cid if cid in UPG_LAYOUT else it['text'][:-2].decode('utf-16le')
+        st = struct.unpack_from('<I', it['fixed'], 8)[0]
+        if key in UPG_LAYOUT and key not in kept:
+            kept.add(key)
+            struct.pack_into('<hhhh', it['fixed'], 12, *UPG_LAYOUT[key])
+        else:
+            struct.pack_into('<I', it['fixed'], 8, st & ~0x10000000)                 # 去掉 WS_VISIBLE
+    assert kept == set(UPG_LAYOUT), kept
+    pct = {'fixed': bytearray(struct.pack('<IIIhhhhI', 0, 0, 0x50020002, *PCT_RECT, PCT_ID)),   # SS_RIGHT
+           'cls': struct.pack('<HH', 0xFFFF, 0x0082), 'text': wz('0%'), 'extra': b'\0\0'}
+    return serialize_dialog(d, items + [pct])
 
 
 def build(src, dst, upgrader=False, selftest=False):
@@ -758,7 +842,7 @@ def build(src, dst, upgrader=False, selftest=False):
     data = sec['.data']
     g_tick_rva = align(data.VirtualAddress + data.Misc_VirtualSize, 4)
     g_init_rva = g_tick_rva + 4
-    data_vsize = (g_init_rva + 4 if upgrader else g_tick_rva + 4) - data.VirtualAddress
+    data_vsize = (g_init_rva + 24 if upgrader else g_tick_rva + 4) - data.VirtualAddress   # G_INIT, G_HWND, G_PCTBUF[16]
     assert data_vsize <= align(data.Misc_VirtualSize, 0x1000)
     g_tick, g_init = IMAGE_BASE + g_tick_rva, IMAGE_BASE + g_init_rva
 
