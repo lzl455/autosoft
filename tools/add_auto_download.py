@@ -52,6 +52,12 @@
    美化：对话框字体换成微软雅黑，窗口背景白色 (WM_CTLCOLORDLG)，右侧标签用放大 4/3 的
    粗体（按对话框字体算，跟随 DPI），文字颜色按内容区分 (WM_CTLCOLORSTATIC)：
    百分比深灰、“请插入你的键盘”蓝色、“升级成功”绿色。
+   程序图标换成 upgrader/upgrader_icon.ico（资源目录整体重建到新增的 .rsrc 节，原节改名 .oldrsrc，
+   用的是 upgrader/make_upgrader.py 里的 set_icon，生成升级程序时还可以再换）。
+10. 升级成功后自动退出（配置区选项 CFG_AUTO_EXIT）：“下载程序”流程里跳转 APP 成功
+    (0x404B6C) 时显示“升级成功”，启动一个 EXIT_DELAY_MS 的定时器；定时器到点后
+    投递 WM_COMMAND(IDCANCEL)，与点“退出”相同。“读取程序”后的跳转(0x404212)不触发。
+
 11. 升级失败时进度条变红 (PBM_SETSTATE PBST_ERROR)，右侧标签换成“重试”按钮。失败判定:
     “下载程序”里调用下载流程(0x404B2F)后状态不是 5，或跳转 APP(0x404B6C)后状态不是 2。
     点“重试”: 设备还连着就重新载入固件并下载，已拔出就显示“请插入你的键盘”。
@@ -67,11 +73,8 @@
     100% 时临时把范围扩到 101），再 UpdateWindow 立即重画。
 16. 打开一次只升级一次：升级成功后 (G_UI = 2) auto_ready 一直返回 0，之后的断开/接入既不
     再触发升级，也不改界面（保持满格和“升级成功”），直到关闭程序。失败不算，可以重试。
-   程序图标换成 upgrader/upgrader_icon.ico（资源目录整体重建到新增的 .rsrc 节，原节改名 .oldrsrc，
-   用的是 upgrader/make_upgrader.py 里的 set_icon，生成升级程序时还可以再换）。
-10. 升级成功后自动退出（配置区选项 CFG_AUTO_EXIT）：“下载程序”流程里跳转 APP 成功
-    (0x404B6C) 时显示“升级成功”，启动一个 EXIT_DELAY_MS 的定时器；定时器到点后
-    投递 WM_COMMAND(IDCANCEL)，与点“退出”相同。“读取程序”后的跳转(0x404212)不触发。
+17. 校验进度按实际长度算：原程序校验循环(0x403A4D)的进度 = 累计 0x2D00/块 ÷ 芯片 Flash 大小，
+    固件比 Flash 小时校验只走到一部分就跳到 100%。改为 已校验偏移 [ebp-0x28] × 100 ÷ 固件长度。
 
 原程序里与本补丁有关的内容（逆向所得）
     0x56E0A4  DWORD 状态机: 0 空闲 / 3 等待进BOOT后下载 / 6 等待进BOOT后读取
@@ -123,6 +126,7 @@ FN_DOWNLOAD = 0x403190
 FN_PROGRESS = 0x403130                # 设置进度条位置 (this, 位置)，cdecl 风格 ret 8
 G_STATE = 0x56E0A4
 G_CHIP = 0x56E060
+G_FWBYTES = 0x56E08C                  # 本次下载/校验的字节数（固件长度）
 IAT_SendDlgItemMessageW = 0x51E6CC
 IAT_GetTickCount = 0x51E374
 IAT_CheckDlgButton = 0x51E6C8
@@ -165,6 +169,7 @@ UPG_CALL_SITES = {
     0x404B6C: (FN_JUMP_APP, 'hook_jump_dl'),        # 下载成功后跳转 APP -> 自动退出 / 失败显示重试
     0x404B2F: (FN_DOWNLOAD, 'hook_download'),       # 下载流程 -> 失败显示重试
     0x4039AE: (FN_PROGRESS, 'hook_verify_start'),   # 校验开始(进度清零) -> 进入校验阶段
+    0x403A4D: (FN_PROGRESS, 'hook_verify_progress'),# 校验循环里的进度 -> 按固件长度重算
     0x402474: (FN_CWND_GETDLGITEM, 'hook_disc'),    # 设备断开 -> 显示“请插入你的键盘”
     0x40271F: (FN_FILE_DOMODAL, 'hook_domodal'),    # 不弹选择文件对话框
     0x402782: (FN_CSTR_ASSIGN, 'hook_assign'),      # 路径 = “内置固件\<名称>”
@@ -801,6 +806,24 @@ bar_snap:
 ; ---- 替换 0x4039AE 处校验开始时的“进度清零”：进入校验阶段 ----
 hook_verify_start:
     mov     byte [G_PHASE], 1
+    jmp     FN_PROGRESS
+
+; ---- 替换 0x403A4D 处校验循环的进度: 按“已校验字节 / 固件长度”重算 ----
+; [esp+4] = this, [esp+8] = 原程序算的位置；ebp 仍是下载流程的栈帧，[ebp-0x28] = 已校验到的偏移
+hook_verify_progress:
+    mov     ecx, [G_FWBYTES]
+    test    ecx, ecx
+    jz      .go
+    mov     eax, [ebp - 0x28]
+    mov     edx, 100
+    mul     edx
+    div     ecx
+    cmp     eax, 100
+    jbe     .ok
+    mov     eax, 100
+.ok:
+    mov     [esp + 8], eax
+.go:
     jmp     FN_PROGRESS
 
 ; ---- eax = 百分比，写到 PCT_ID 标签并立即重绘 ----
