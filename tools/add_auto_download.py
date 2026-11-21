@@ -78,6 +78,8 @@
 18. 前后两段速度一致：下载每块(128/256 字节)要发 ceil(块/28) 次 FIFO + 1 次写 Flash，约 6 次传输
     /128 字节，校验 1 次/128 字节，所以下载占 DL_SHARE=85%。下载循环(0x403717)的进度原来是
     10 + 偏移×80÷长度，循环结束再跳到 100；改为 10 + 偏移×90÷长度，让它连续走到 100。
+19. 不闪：原程序每 128 字节设一次进度，校验很快且只占 15 个百分点，同一个数会连着设好几次，
+    每次都重画标签和进度条就会闪。显示值和上次一样 (G_LASTPCT) 且标签正显示百分比时跳过重画。
 
 原程序里与本补丁有关的内容（逆向所得）
     0x56E0A4  DWORD 状态机: 0 空闲 / 3 等待进BOOT后下载 / 6 等待进BOOT后读取
@@ -700,6 +702,7 @@ ui_connected:
     cmp     al, 1
     jne     .r
     mov     byte [G_LBL], 0
+    mov     byte [G_LASTPCT], 0
     push    str_zero
     call    set_label
 .r:
@@ -750,8 +753,14 @@ hook_setpos:
     push    eax
     cmp     dword [esp + 12], 0x402     ; PBM_SETPOS
     jne     .ret
-    mov     eax, [esp + 8]              ; 进度条
     mov     ecx, [esp + 16]             ; 位置 0~100
+    cmp     byte [G_LBL], 0             ; 标签正显示百分比，且数没变 -> 不重画（否则会闪）
+    jne     .draw
+    cmp     cl, [G_LASTPCT]
+    je      .ret
+.draw:
+    mov     [G_LASTPCT], cl
+    mov     eax, [esp + 8]              ; 进度条
     call    bar_snap
     mov     eax, [esp + 16]
     call    show_percent
@@ -1104,7 +1113,7 @@ def assemble(stub_va, g_tick, g_init=0, upgrader=False, selftest=False):
             'TITLE_CHARS': TITLE_CHARS, 'PATH_CHARS': PATH_CHARS, 'CFG_AUTO_EXIT': CFG_AUTO_EXIT,
             'EXIT_TIMER_ID': EXIT_TIMER_ID, 'EXIT_DELAY_MS': EXIT_DELAY_MS,
             'G_HWND': g_hwnd, 'G_PCTBUF': g_pctbuf, 'G_UI': g_init + 24, 'G_LBL': g_init + 25, 'G_FAIL': g_init + 26,
-            'G_TRIES': g_init + 27, 'G_PHASE': g_init + 28, 'DL_SHARE': DL_SHARE, 'START_TIMER_ID': START_TIMER_ID, 'START_DELAY_MS': START_DELAY_MS,
+            'G_TRIES': g_init + 27, 'G_PHASE': g_init + 28, 'G_LASTPCT': g_init + 29, 'DL_SHARE': DL_SHARE, 'START_TIMER_ID': START_TIMER_ID, 'START_DELAY_MS': START_DELAY_MS,
             'WATCH_TIMER_ID': WATCH_TIMER_ID, 'WATCH_MS': WATCH_MS, 'SWITCH_TRIES': SWITCH_TRIES,
             'RETRY_ID': RETRY_ID,
             'PCT_ID': PCT_ID, 'CLR_PERCENT': CLR_PERCENT, 'CLR_PROMPT': CLR_PROMPT,
