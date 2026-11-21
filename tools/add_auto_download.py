@@ -60,6 +60,8 @@
     准备好，命令会丢，之后一直等不到 BOOT 设备，进度条停在 0%）。发出后启动看门狗：
     WATCH_MS 内没进入下载就重发，最多 SWITCH_TRIES 次，仍不行则显示失败和“重试”。
 13. 模板本身（没装固件）被双击运行时，弹出说明（应运行生成的“<名称>_升级.exe”）后退出。
+14. 进度连续：原程序下载阶段进度 0→100，校验开始(0x4039AE)时又从 0→100。改为下载占
+    0~DL_SHARE%，校验占 DL_SHARE~100%（G_PHASE 标记阶段，在 PBM_SETPOS 钩子里换算）。
    程序图标换成 upgrader/upgrader_icon.ico（资源目录整体重建到新增的 .rsrc 节，原节改名 .oldrsrc，
    用的是 upgrader/make_upgrader.py 里的 set_icon，生成升级程序时还可以再换）。
 10. 升级成功后自动退出（配置区选项 CFG_AUTO_EXIT）：“下载程序”流程里跳转 APP 成功
@@ -113,6 +115,7 @@ FN_FILE_DOMODAL = 0x41592D
 FN_CSTR_ASSIGN = 0x4013C0
 FN_CWND_GETDLGITEM = 0x40C5CE
 FN_DOWNLOAD = 0x403190
+FN_PROGRESS = 0x403130                # 设置进度条位置 (this, 位置)，cdecl 风格 ret 8
 G_STATE = 0x56E0A4
 G_CHIP = 0x56E060
 IAT_SendDlgItemMessageW = 0x51E6CC
@@ -156,6 +159,7 @@ CALL_SITES = {
 UPG_CALL_SITES = {
     0x404B6C: (FN_JUMP_APP, 'hook_jump_dl'),        # 下载成功后跳转 APP -> 自动退出 / 失败显示重试
     0x404B2F: (FN_DOWNLOAD, 'hook_download'),       # 下载流程 -> 失败显示重试
+    0x4039AE: (FN_PROGRESS, 'hook_verify_start'),   # 校验开始(进度清零) -> 进入校验阶段
     0x402474: (FN_CWND_GETDLGITEM, 'hook_disc'),    # 设备断开 -> 显示“请插入你的键盘”
     0x40271F: (FN_FILE_DOMODAL, 'hook_domodal'),    # 不弹选择文件对话框
     0x402782: (FN_CSTR_ASSIGN, 'hook_assign'),      # 路径 = “内置固件\<名称>”
@@ -209,6 +213,7 @@ START_DELAY_MS = 1000
 WATCH_TIMER_ID = 0xB1C7               # 等待设备切到 BOOT 的看门狗
 WATCH_MS = 15000                      # 第一次插 BOOT 设备时 Windows 可能要装驱动，留足时间
 SWITCH_TRIES = 3
+DL_SHARE = 70                         # 下载阶段占进度条的百分比，其余给校验
 EXIT_DELAY_MS = 1000
 CFG_AUTO_EXIT = 1                     # 配置区选项位: 升级成功后自动退出
 UPG_SECTION = b'.upg'
@@ -557,7 +562,9 @@ hook_jump_dl:
 ; ---- 替换 0x404B2F 处“下载程序”里对下载流程的调用（ebx = esi = this）----
 hook_download:
     call    clear_fail
+    mov     byte [G_PHASE], 0
     call    FN_DOWNLOAD
+    mov     byte [G_PHASE], 0
     cmp     dword [G_STATE], 5          ; 5 = 下载校验成功
     je      .ok
     call    on_fail
@@ -696,6 +703,26 @@ set_label:
 
 ; ---- 替换设置进度条位置的 call [SendMessageW]: 同时更新百分比标签 ----
 hook_setpos:
+    cmp     dword [esp + 8], 0x402      ; PBM_SETPOS: 按阶段换算位置
+    jne     .send
+    mov     eax, [esp + 12]
+    cmp     eax, 100
+    jbe     .inrange
+    mov     eax, 100
+.inrange:
+    cmp     byte [G_PHASE], 0
+    jne     .verify
+    imul    eax, eax, DL_SHARE          ; 下载: 0~DL_SHARE
+    jmp     .scale
+.verify:
+    imul    eax, eax, 100 - DL_SHARE    ; 校验: DL_SHARE~100
+    add     eax, DL_SHARE * 100
+.scale:
+    xor     edx, edx
+    mov     ecx, 100
+    div     ecx
+    mov     [esp + 12], eax
+.send:
     push    dword [esp + 16]
     push    dword [esp + 16]
     push    dword [esp + 16]
@@ -709,6 +736,11 @@ hook_setpos:
 .ret:
     pop     eax
     ret     16
+
+; ---- 替换 0x4039AE 处校验开始时的“进度清零”：进入校验阶段 ----
+hook_verify_start:
+    mov     byte [G_PHASE], 1
+    jmp     FN_PROGRESS
 
 ; ---- eax = 百分比，写到 PCT_ID 标签并立即重绘 ----
 show_percent:
@@ -965,7 +997,7 @@ def assemble(stub_va, g_tick, g_init=0, upgrader=False, selftest=False):
             'TITLE_CHARS': TITLE_CHARS, 'PATH_CHARS': PATH_CHARS, 'CFG_AUTO_EXIT': CFG_AUTO_EXIT,
             'EXIT_TIMER_ID': EXIT_TIMER_ID, 'EXIT_DELAY_MS': EXIT_DELAY_MS,
             'G_HWND': g_hwnd, 'G_PCTBUF': g_pctbuf, 'G_UI': g_init + 24, 'G_LBL': g_init + 25, 'G_FAIL': g_init + 26,
-            'G_TRIES': g_init + 27, 'START_TIMER_ID': START_TIMER_ID, 'START_DELAY_MS': START_DELAY_MS,
+            'G_TRIES': g_init + 27, 'G_PHASE': g_init + 28, 'DL_SHARE': DL_SHARE, 'START_TIMER_ID': START_TIMER_ID, 'START_DELAY_MS': START_DELAY_MS,
             'WATCH_TIMER_ID': WATCH_TIMER_ID, 'WATCH_MS': WATCH_MS, 'SWITCH_TRIES': SWITCH_TRIES,
             'RETRY_ID': RETRY_ID,
             'PCT_ID': PCT_ID, 'CLR_PERCENT': CLR_PERCENT, 'CLR_PROMPT': CLR_PROMPT,
@@ -1197,7 +1229,7 @@ def build(src, dst, upgrader=False, selftest=False):
     data = sec['.data']
     g_tick_rva = align(data.VirtualAddress + data.Misc_VirtualSize, 4)
     g_init_rva = g_tick_rva + 4
-    data_vsize = (g_init_rva + 28 if upgrader else g_tick_rva + 4) - data.VirtualAddress   # G_INIT, G_HWND, G_PCTBUF[16], G_UI
+    data_vsize = (g_init_rva + 32 if upgrader else g_tick_rva + 4) - data.VirtualAddress   # G_INIT, G_HWND, G_PCTBUF[16], G_UI
     assert data_vsize <= align(data.Misc_VirtualSize, 0x1000)
     g_tick, g_init = IMAGE_BASE + g_tick_rva, IMAGE_BASE + g_init_rva
 
