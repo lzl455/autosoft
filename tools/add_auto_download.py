@@ -56,6 +56,9 @@
     “下载程序”里调用下载流程(0x404B2F)后状态不是 5，或跳转 APP(0x404B6C)后状态不是 2。
     点“重试”: 设备还连着就重新载入固件并下载，已拔出就显示“请插入你的键盘”。
     重新下载、设备拔出或接入时恢复正常显示。
+12. 正常模式接入后不立即发“切到 BOOT”命令，等 START_DELAY_MS 再发（刚插上的设备可能还没
+    准备好，命令会丢，之后一直等不到 BOOT 设备，进度条停在 0%）。发出后启动看门狗：
+    WATCH_MS 内没进入下载就重发，最多 SWITCH_TRIES 次，仍不行则显示失败和“重试”。
    程序图标换成 upgrader/upgrader_icon.ico（资源目录整体重建到新增的 .rsrc 节，原节改名 .oldrsrc，
    用的是 upgrader/make_upgrader.py 里的 set_icon，生成升级程序时还可以再换）。
 10. 升级成功后自动退出（配置区选项 CFG_AUTO_EXIT）：“下载程序”流程里跳转 APP 成功
@@ -196,6 +199,11 @@ RETRY_RECT = (226, 13, 62, 18)
 STR_NOUSB = '请插入你的键盘'
 STR_DONE = '升级成功'
 EXIT_TIMER_ID = 0xB1C5
+START_TIMER_ID = 0xB1C6               # 正常模式接入后延迟开始
+START_DELAY_MS = 1000
+WATCH_TIMER_ID = 0xB1C7               # 等待设备切到 BOOT 的看门狗
+WATCH_MS = 15000                      # 第一次插 BOOT 设备时 Windows 可能要装驱动，留足时间
+SWITCH_TRIES = 3
 EXIT_DELAY_MS = 1000
 CFG_AUTO_EXIT = 1                     # 配置区选项位: 升级成功后自动退出
 UPG_SECTION = b'.upg'
@@ -249,10 +257,15 @@ hook_app:
     test    eax, eax
     jz      .done
 %if UPGRADER
-    call    load_fw
-%endif
+    push    0                           ; 等一会儿再开始（见 WM_TIMER START_TIMER_ID）
+    push    START_DELAY_MS
+    push    START_TIMER_ID
+    push    dword [esi + 0x20]
+    call    [IAT_SetTimer]
+%else
     mov     ecx, esi
     call    FN_ON_DOWNLOAD              ; 发切换命令, 状态置 3
+%endif
 .done:
     ret
 
@@ -291,6 +304,23 @@ auto_ready:
     ret
 
 ; ---- 载入内置固件：调用“打开文件”处理函数 (esi = this) ----
+; ---- 载入固件并开始“下载程序”(esi = this)；发了切换命令就启动看门狗 ----
+start_download:
+    mov     byte [G_TRIES], 0
+dl_again:
+    call    load_fw
+    mov     ecx, esi
+    call    FN_ON_DOWNLOAD
+    cmp     dword [G_STATE], 3          ; 3 = 已发切换命令，等 BOOT 设备
+    jne     .r
+    push    0
+    push    WATCH_MS
+    push    WATCH_TIMER_ID
+    push    dword [esi + 0x20]
+    call    [IAT_SetTimer]
+.r:
+    ret
+
 load_fw:
     mov     ecx, esi
     jmp     FN_OPEN_FILE
@@ -397,6 +427,10 @@ hook_wndproc:
 .timer:
     cmp     dword [esp + 4], 0x113      ; WM_TIMER
     jne     .cmd
+    cmp     dword [esp + 8], START_TIMER_ID
+    je      .start
+    cmp     dword [esp + 8], WATCH_TIMER_ID
+    je      .watch
     cmp     dword [esp + 8], EXIT_TIMER_ID
     jne     .pass
     push    EXIT_TIMER_ID
@@ -407,6 +441,39 @@ hook_wndproc:
     push    0x111
     push    dword [edi + 0x20]
     call    [IAT_PostMessageW]
+    mov     ecx, edi
+    jmp     .pass
+.start:                                 ; 正常模式接入 START_DELAY_MS 后
+    push    START_TIMER_ID
+    push    dword [edi + 0x20]
+    call    [IAT_KillTimer]
+    mov     ecx, edi
+    cmp     byte [edi + 0x10E28], 0     ; 已经拔掉了
+    je      .pass
+    cmp     dword [G_STATE], 3          ; 已经在切换
+    je      .pass
+    jmp     .go
+.watch:                                 ; 发切换命令后 WATCH_MS 还没开始下载
+    push    WATCH_TIMER_ID
+    push    dword [edi + 0x20]
+    call    [IAT_KillTimer]
+    mov     ecx, edi
+    cmp     dword [G_STATE], 3
+    jne     .pass                       ; 已经下载过了
+    cmp     byte [edi + 0x10E28], 0
+    je      .wfail                      ; 设备断开后没以 BOOT 身份回来
+    inc     byte [G_TRIES]
+    cmp     byte [G_TRIES], SWITCH_TRIES
+    jae     .wfail
+    push    esi                         ; 还是正常模式：重发切换命令
+    mov     esi, edi
+    call    dl_again
+    pop     esi
+    mov     ecx, edi
+    jmp     .pass
+.wfail:
+    mov     dword [G_STATE], 0          ; 之后 BOOT 设备若出现，仍会自动下载
+    call    on_fail
     mov     ecx, edi
     jmp     .pass
 .cmd:
@@ -439,9 +506,7 @@ hook_wndproc:
     jz      .pass
     push    esi
     mov     esi, edi
-    call    load_fw
-    mov     ecx, edi
-    call    FN_ON_DOWNLOAD
+    call    start_download
     pop     esi
 %endif
     mov     ecx, edi
@@ -878,6 +943,8 @@ def assemble(stub_va, g_tick, g_init=0, upgrader=False, selftest=False):
             'TITLE_CHARS': TITLE_CHARS, 'PATH_CHARS': PATH_CHARS, 'CFG_AUTO_EXIT': CFG_AUTO_EXIT,
             'EXIT_TIMER_ID': EXIT_TIMER_ID, 'EXIT_DELAY_MS': EXIT_DELAY_MS,
             'G_HWND': g_hwnd, 'G_PCTBUF': g_pctbuf, 'G_UI': g_init + 24, 'G_LBL': g_init + 25, 'G_FAIL': g_init + 26,
+            'G_TRIES': g_init + 27, 'START_TIMER_ID': START_TIMER_ID, 'START_DELAY_MS': START_DELAY_MS,
+            'WATCH_TIMER_ID': WATCH_TIMER_ID, 'WATCH_MS': WATCH_MS, 'SWITCH_TRIES': SWITCH_TRIES,
             'RETRY_ID': RETRY_ID,
             'PCT_ID': PCT_ID, 'CLR_PERCENT': CLR_PERCENT, 'CLR_PROMPT': CLR_PROMPT,
             # 颜色立即数如果恰好落在映像地址范围内，会被当成地址加上重定位；高字节置 FF 再 and 掉
