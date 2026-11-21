@@ -59,6 +59,7 @@
 12. 正常模式接入后不立即发“切到 BOOT”命令，等 START_DELAY_MS 再发（刚插上的设备可能还没
     准备好，命令会丢，之后一直等不到 BOOT 设备，进度条停在 0%）。发出后启动看门狗：
     WATCH_MS 内没进入下载就重发，最多 SWITCH_TRIES 次，仍不行则显示失败和“重试”。
+13. 模板本身（没装固件）被双击运行时，弹出说明（应运行生成的“<名称>_升级.exe”）后退出。
    程序图标换成 upgrader/upgrader_icon.ico（资源目录整体重建到新增的 .rsrc 节，原节改名 .oldrsrc，
    用的是 upgrader/make_upgrader.py 里的 set_icon，生成升级程序时还可以再换）。
 10. 升级成功后自动退出（配置区选项 CFG_AUTO_EXIT）：“下载程序”流程里跳转 APP 成功
@@ -138,6 +139,7 @@ IAT_SetTextColor = 0x51E1B0
 IAT_SetBkMode = 0x51E194
 IAT_GetStockObject = 0x51E0AC
 IAT_ShowWindow = 0x51E6B8
+IAT_MessageBoxW = 0x51E7C0
 IAT_SetTimer = 0x51E5E8
 IAT_KillTimer = 0x51E5E4
 
@@ -198,6 +200,9 @@ RETRY_ID = 1054                       # 失败后出现的“重试”按钮
 RETRY_RECT = (226, 13, 62, 18)
 STR_NOUSB = '请插入你的键盘'
 STR_DONE = '升级成功'
+STR_NOFW = ('这是升级程序的模板，里面没有固件，不能直接用来升级。\r\n\r\n'
+            '请把固件 .bin 文件拖到 make_upgrader.bat 上，\r\n'
+            '然后运行在 .bin 旁边生成的“<名称>_升级.exe”。')
 EXIT_TIMER_ID = 0xB1C5
 START_TIMER_ID = 0xB1C6               # 正常模式接入后延迟开始
 START_DELAY_MS = 1000
@@ -490,6 +495,21 @@ hook_wndproc:
 .kick:
     cmp     dword [esp + 8], KICK_ID
     jne     .pass
+    cmp     dword [fw_len], 0           ; 模板本身被运行：说明后退出
+    jne     .hasfw
+    push    0x40                        ; MB_ICONINFORMATION
+    push    str_nofw_title
+    push    str_nofw
+    push    dword [edi + 0x20]
+    call    [IAT_MessageBoxW]
+    push    0
+    push    2                           ; IDCANCEL
+    push    0x111
+    push    dword [edi + 0x20]
+    call    [IAT_PostMessageW]
+    mov     ecx, edi
+    jmp     .pass
+.hasfw:
 %ifdef SELFTEST
 .go:
     mov     dword [G_CHIP], 0x96FF00    ; 自测: 假装连着 BYC951，只载入固件
@@ -924,6 +944,8 @@ fw_path:    times PATH_CHARS dw 0
 str_nousb:  dw NOUSB_CHARS, 0
 str_done:   dw DONE_CHARS, 0
 str_zero:   dw '0', '%', 0
+str_nofw:   dw NOFW_CHARS, 0
+str_nofw_title: dw NOFW_TITLE_CHARS, 0
 %else
 str_key:    dw REG_KEY_CHARS, 0
 str_value:  dw REG_VALUE_CHARS, 0
@@ -964,6 +986,8 @@ def assemble(stub_va, g_tick, g_init=0, upgrader=False, selftest=False):
             f.write("%%define CFG_MAGIC_STR '%s'\n" % CFG_MAGIC.decode())
             f.write('%%define NOUSB_CHARS %s\n' % chars(STR_NOUSB))
             f.write('%%define DONE_CHARS %s\n' % chars(STR_DONE))
+            f.write('%%define NOFW_CHARS %s\n' % chars(STR_NOFW))
+            f.write('%%define NOFW_TITLE_CHARS %s\n' % chars(UPG_DLG_TITLE))
             if selftest:
                 f.write('%define SELFTEST 1\n')
             f.write(STUB_ASM)

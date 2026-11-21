@@ -312,6 +312,8 @@ def make_one(path, output, title, template, auto_exit, icon=None):
     print('升级成功 : %s' % ('1 秒后自动退出' if auto_exit else '保持打开，可连续升级'))
     print('图标     : %s' % (icon[0] if icon else '默认'))
     print('已生成   : %s' % out)
+    print('请双击运行上面这个文件进行升级（不是 Upgrader_Template.exe）。')
+    return out
 
 
 def main():
@@ -328,6 +330,7 @@ def main():
     a = ap.parse_args()
 
     failed = 0
+    made = None
     icon_path = a.icon
     bins = []
     for p in a.bin:
@@ -356,7 +359,7 @@ def main():
             for path in a.bin:
                 print()
                 try:
-                    make_one(path, a.output, a.title, template, not a.no_exit, icon)
+                    made = make_one(path, a.output, a.title, template, not a.no_exit, icon)
                 except SystemExit as e:
                     print('错误: %s（%s）' % (e.code, path))
                     failed += 1
@@ -373,6 +376,12 @@ def main():
         import traceback
         traceback.print_exc()
         failed = 1
+    if a.pause and made and os.name == 'nt':           # 打开所在文件夹并选中生成的 exe
+        import subprocess
+        try:
+            subprocess.Popen('explorer /select,"%s"' % os.path.abspath(made))
+        except OSError:
+            pass
     if a.pause:
         print()
         try:
