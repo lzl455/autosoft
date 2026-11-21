@@ -4,7 +4,7 @@
 把固件 .bin 装进 Upgrader_Template.exe，生成可以直接双击使用的一键升级程序。
 
 用法:
-    python make_upgrader.py 固件.bin [-o 输出.exe] [--title 窗口标题] [--icon 图标.ico] [--no-exit]
+    python make_upgrader.py 固件.bin [-o 输出.exe] [--title 窗口标题] [--icon 图标.ico] [--auto-exit]
                             [--template 模板.exe]
 
 也可以把 .bin 文件直接拖到 make_upgrader.bat 上（没装 Python 时 bat 会改用 PowerShell，
@@ -14,7 +14,7 @@
 只用到 Python 标准库（Python 3.6 及以上），不需要安装其它东西。
 
 生成的 exe = 模板 + 配置区（固件长度、选项、标题、固件名）+ 文件末尾附加的固件。
-默认升级成功 1 秒后自动退出；加 --no-exit 则保持打开，可以连续升级多台。
+默认升级成功后保持打开，由用户关闭（也可以拔出换下一台继续升级）；加 --auto-exit 则升级成功 1 秒后自动退出。
 升级程序运行时以只读方式打开自身，从“文件末尾 - 固件长度”处读出固件，
 交给原程序照常解析、下载、校验。
 """
@@ -264,7 +264,7 @@ def fix_checksum(exe):
     return bytes(exe)
 
 
-def build(template, fw, title, name, auto_exit=True, icon=None):
+def build(template, fw, title, name, auto_exit=False, icon=None):
     exe = bytearray(template)
     if exe[:2] != b'MZ':
         raise SystemExit('模板不是 exe 文件')
@@ -310,7 +310,7 @@ def make_one(path, output, title, template, auto_exit, icon=None, out_dir=None):
         f.write(exe)
     print('固件     : %s (%d 字节)' % (path, len(fw)))
     print('窗口标题 : %s' % title[:TITLE_CHARS - 1])
-    print('升级成功 : %s' % ('1 秒后自动退出' if auto_exit else '保持打开，可连续升级'))
+    print('升级成功 : %s' % ('1 秒后自动退出' if auto_exit else '保持打开，由用户关闭'))
     print('图标     : %s' % (icon[0] if icon else '默认'))
     print('已生成   : %s' % out)
     print('请双击运行上面这个文件进行升级（不是 Upgrader_Template.exe）。')
@@ -325,7 +325,8 @@ def main():
     ap.add_argument('-o', '--output', help='输出 exe（只给一个 .bin 时可用；默认: upgrader 文件夹里的 <名称>_升级.exe）')
     ap.add_argument('--title', help='窗口标题（默认: 固件升级）')
     ap.add_argument('--icon', help='程序图标 .ico（或不超过 256x256 的正方形 .png）')
-    ap.add_argument('--no-exit', action='store_true', help='升级成功后不自动退出（连续升级多台时用）')
+    ap.add_argument('--auto-exit', action='store_true', help='升级成功 1 秒后自动退出（默认保持打开，由用户关闭）')
+    ap.add_argument('--no-exit', action='store_true', help=argparse.SUPPRESS)   # 旧选项，现在就是默认行为
     ap.add_argument('--template', default=os.path.join(here, 'Upgrader_Template.exe'), help='模板 exe')
     ap.add_argument('--pause', action='store_true', help='结束前等待按回车（供 make_upgrader.bat 使用）')
     a = ap.parse_args()
@@ -360,7 +361,7 @@ def main():
             for path in a.bin:
                 print()
                 try:
-                    made = make_one(path, a.output, a.title, template, not a.no_exit, icon, here)
+                    made = make_one(path, a.output, a.title, template, a.auto_exit and not a.no_exit, icon, here)
                 except SystemExit as e:
                     print('错误: %s（%s）' % (e.code, path))
                     failed += 1

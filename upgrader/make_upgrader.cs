@@ -138,10 +138,10 @@ public static class UpgraderMaker
                         string name = Path.GetFileName(bin);
                         string outPath = Path.Combine(outDir, Path.GetFileNameWithoutExtension(bin) + "_升级.exe");
                         byte[] fw = File.ReadAllBytes(bin);
-                        File.WriteAllBytes(outPath, Build(template, fw, "固件升级", name, true));
+                        File.WriteAllBytes(outPath, Build(template, fw, "固件升级", name, false));
                         Console.WriteLine("固件     : {0} ({1} 字节)", bin, fw.Length);
                         Console.WriteLine("窗口标题 : 固件升级");
-                        Console.WriteLine("升级成功 : 1 秒后自动退出");
+                        Console.WriteLine("升级成功 : 保持打开，由用户关闭");
                         Console.WriteLine("已生成   : {0}", outPath);
                         Console.WriteLine("请双击运行上面这个文件进行升级（不是 Upgrader_Template.exe）。");
                         made = outPath;
