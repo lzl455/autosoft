@@ -75,6 +75,9 @@
     再触发升级，也不改界面（保持满格和“升级成功”），直到关闭程序。失败不算，可以重试。
 17. 校验进度按实际长度算：原程序校验循环(0x403A4D)的进度 = 累计 0x2D00/块 ÷ 芯片 Flash 大小，
     固件比 Flash 小时校验只走到一部分就跳到 100%。改为 已校验偏移 [ebp-0x28] × 100 ÷ 固件长度。
+18. 前后两段速度一致：下载每块(128/256 字节)要发 ceil(块/28) 次 FIFO + 1 次写 Flash，约 6 次传输
+    /128 字节，校验 1 次/128 字节，所以下载占 DL_SHARE=85%。下载循环(0x403717)的进度原来是
+    10 + 偏移×80÷长度，循环结束再跳到 100；改为 10 + 偏移×90÷长度，让它连续走到 100。
 
 原程序里与本补丁有关的内容（逆向所得）
     0x56E0A4  DWORD 状态机: 0 空闲 / 3 等待进BOOT后下载 / 6 等待进BOOT后读取
@@ -170,6 +173,7 @@ UPG_CALL_SITES = {
     0x404B2F: (FN_DOWNLOAD, 'hook_download'),       # 下载流程 -> 失败显示重试
     0x4039AE: (FN_PROGRESS, 'hook_verify_start'),   # 校验开始(进度清零) -> 进入校验阶段
     0x403A4D: (FN_PROGRESS, 'hook_verify_progress'),# 校验循环里的进度 -> 按固件长度重算
+    0x403717: (FN_PROGRESS, 'hook_dl_progress'),    # 下载循环里的进度 -> 连续走到 100
     0x402474: (FN_CWND_GETDLGITEM, 'hook_disc'),    # 设备断开 -> 显示“请插入你的键盘”
     0x40271F: (FN_FILE_DOMODAL, 'hook_domodal'),    # 不弹选择文件对话框
     0x402782: (FN_CSTR_ASSIGN, 'hook_assign'),      # 路径 = “内置固件\<名称>”
@@ -223,7 +227,7 @@ START_DELAY_MS = 1000
 WATCH_TIMER_ID = 0xB1C7               # 等待设备切到 BOOT 的看门狗
 WATCH_MS = 15000                      # 第一次插 BOOT 设备时 Windows 可能要装驱动，留足时间
 SWITCH_TRIES = 3
-DL_SHARE = 70                         # 下载阶段占进度条的百分比，其余给校验
+DL_SHARE = 85                         # 下载阶段占进度条的百分比，其余给校验（按传输次数，约 6:1）
 EXIT_DELAY_MS = 1000
 CFG_AUTO_EXIT = 1                     # 配置区选项位: 升级成功后自动退出
 UPG_SECTION = b'.upg'
@@ -806,6 +810,25 @@ bar_snap:
 ; ---- 替换 0x4039AE 处校验开始时的“进度清零”：进入校验阶段 ----
 hook_verify_start:
     mov     byte [G_PHASE], 1
+    jmp     FN_PROGRESS
+
+; ---- 替换 0x403717 处下载循环的进度: 10 + 已写字节 × 90 / 固件长度 ----
+; [esp+8] = 原程序算的位置；ebp 是下载流程的栈帧，[ebp-0x20] = 本块的起始偏移
+hook_dl_progress:
+    mov     ecx, [G_FWBYTES]
+    test    ecx, ecx
+    jz      .go
+    mov     eax, [ebp - 0x20]
+    mov     edx, 90
+    mul     edx
+    div     ecx
+    add     eax, 10
+    cmp     eax, 100
+    jbe     .ok
+    mov     eax, 100
+.ok:
+    mov     [esp + 8], eax
+.go:
     jmp     FN_PROGRESS
 
 ; ---- 替换 0x403A4D 处校验循环的进度: 按“已校验字节 / 固件长度”重算 ----
