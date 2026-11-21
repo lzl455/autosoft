@@ -6,7 +6,9 @@
 | `BootLoader_Tools_v3.5.7.1_AutoDL.exe` | 增加了“自动下载模式”的版本 |
 | `tools/add_auto_download.py` | 由原版生成 AutoDL 版和一键升级模板的补丁脚本（原程序没有源码，功能以二进制补丁方式加入） |
 | `upgrader/Upgrader_Template.exe` | 一键升级程序的模板（本身不含固件，不直接使用） |
-| `upgrader/make_upgrader.py` / `make_upgrader.bat` | 把固件 `.bin` 装进模板，生成双击即可升级的 exe |
+| `upgrader/make_upgrader.bat` | 把固件 `.bin` 拖到它上面，生成双击即可升级的 exe |
+| `upgrader/make_upgrader.py` | 生成器（装了 Python 时使用，支持换图标等选项） |
+| `upgrader/make_upgrader.ps1` / `make_upgrader.cs` | 生成器（没装 Python 时 bat 自动改用 Windows 自带的 PowerShell） |
 | `upgrader/upgrader_icon.ico` | 升级程序的默认图标（由 `tools/make_default_icon.py` 生成） |
 
 ## 自动下载模式
@@ -34,11 +36,12 @@
 
 ## 一键升级程序（把 .bin 做成双击即可升级的 exe）
 
-生成（需要 Windows 上装有 Python 3，安装时勾选“Add python.exe to PATH”；只用标准库）：
+生成：
 
-- 把固件 `.bin` 拖到 `upgrader/make_upgrader.bat` 上（可以一次拖多个），会在 `.bin` 旁边生成
-  `<名称>_升级.exe`。窗口会停住显示结果，按回车关闭；没装 Python 时也会提示。或者
-- 命令行：
+- 把固件 `.bin` 拖到 `upgrader/make_upgrader.bat` 上（可以一次拖多个），会在 `upgrader` 文件夹里生成
+  `<名称>_升级.exe`。不需要安装任何东西：装了 Python 3 就用 Python，没装就自动改用 Windows 自带的
+  PowerShell。窗口会停住显示结果，按回车关闭。或者
+- 命令行（需要 Python 3，只用标准库）：
 
 ```bash
 python upgrader/make_upgrader.py 固件.bin
@@ -46,9 +49,9 @@ python upgrader/make_upgrader.py 固件.bin
 
 可选参数：`-o 输出.exe` 指定输出文件，`--title "窗口标题"` 指定窗口标题（默认“固件升级”），
 `--no-exit` 升级成功后不自动退出（产线连续升级多台时用），
-`--icon 图标.ico` 换成自己的图标。
+`--icon 图标.ico` 换成自己的图标（换图标需要 Python；走 PowerShell 时用默认图标）。
 
-生成后会自动打开 `.bin` 所在的文件夹并选中生成的 `<名称>_升级.exe`。
+生成后会自动打开 `upgrader` 文件夹并选中生成的 `<名称>_升级.exe`。
 注意：`upgrader/Upgrader_Template.exe` 只是模板，里面没有固件，直接双击它会弹出说明后退出。
 
 使用：把生成的 `<名称>_升级.exe` 发给使用者，双击打开，插入设备即自动升级。

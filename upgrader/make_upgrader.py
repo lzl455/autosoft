@@ -7,7 +7,8 @@
     python make_upgrader.py 固件.bin [-o 输出.exe] [--title 窗口标题] [--icon 图标.ico] [--no-exit]
                             [--template 模板.exe]
 
-也可以把 .bin 文件直接拖到 make_upgrader.bat 上；想换图标就把 .ico 一起拖上去，
+也可以把 .bin 文件直接拖到 make_upgrader.bat 上（没装 Python 时 bat 会改用 PowerShell，
+见 make_upgrader.ps1 / make_upgrader.cs，那条路不支持换图标）；生成的 exe 默认放在 upgrader 文件夹里；想换图标就把 .ico 一起拖上去，
 或者用 --icon 图标.ico。
 
 只用到 Python 标准库（Python 3.6 及以上），不需要安装其它东西。
@@ -297,10 +298,10 @@ def build(template, fw, title, name, auto_exit=True, icon=None):
     return fix_checksum(exe)
 
 
-def make_one(path, output, title, template, auto_exit, icon=None):
+def make_one(path, output, title, template, auto_exit, icon=None, out_dir=None):
     name = os.path.basename(path)
     stem = os.path.splitext(name)[0]
-    out = output or os.path.join(os.path.dirname(os.path.abspath(path)), stem + '_升级.exe')
+    out = output or os.path.join(out_dir or os.path.dirname(os.path.abspath(path)), stem + '_升级.exe')
     title = title if title is not None else '固件升级'
     with open(path, 'rb') as f:
         fw = f.read()
@@ -321,7 +322,7 @@ def main():
     ap = argparse.ArgumentParser(description='把固件 .bin 做成双击即可升级的 exe')
     ap.add_argument('bin', nargs='*', help='固件 .bin 文件（可以一次给多个）；'
                     '混在里面的 .ico/.png 会被当作图标')
-    ap.add_argument('-o', '--output', help='输出 exe（只给一个 .bin 时可用；默认: 与 .bin 同目录，<名称>_升级.exe）')
+    ap.add_argument('-o', '--output', help='输出 exe（只给一个 .bin 时可用；默认: upgrader 文件夹里的 <名称>_升级.exe）')
     ap.add_argument('--title', help='窗口标题（默认: 固件升级）')
     ap.add_argument('--icon', help='程序图标 .ico（或不超过 256x256 的正方形 .png）')
     ap.add_argument('--no-exit', action='store_true', help='升级成功后不自动退出（连续升级多台时用）')
@@ -347,7 +348,7 @@ def main():
             parse_icon(icon[1], icon_path)            # 先检查一遍，有问题早报
         if not a.bin:
             print('用法: 把固件 .bin 文件拖到 make_upgrader.bat 上（可以一次拖多个），')
-            print('      会在 .bin 旁边生成 <名称>_升级.exe。')
+            print('      生成的 <名称>_升级.exe 会放在 upgrader 文件夹里。')
             print('      想换图标，就把 .ico 文件和 .bin 一起拖上去。')
             failed = 1
         elif a.output and len(a.bin) > 1:
@@ -359,7 +360,7 @@ def main():
             for path in a.bin:
                 print()
                 try:
-                    made = make_one(path, a.output, a.title, template, not a.no_exit, icon)
+                    made = make_one(path, a.output, a.title, template, not a.no_exit, icon, here)
                 except SystemExit as e:
                     print('错误: %s（%s）' % (e.code, path))
                     failed += 1
