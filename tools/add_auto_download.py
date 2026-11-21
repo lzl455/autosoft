@@ -62,6 +62,11 @@
 13. 模板本身（没装固件）被双击运行时，弹出说明（应运行生成的“<名称>_升级.exe”）后退出。
 14. 进度连续：原程序下载阶段进度 0→100，校验开始(0x4039AE)时又从 0→100。改为下载占
     0~DL_SHARE%，校验占 DL_SHARE~100%（G_PHASE 标记阶段，在 PBM_SETPOS 钩子里换算）。
+15. 进度条平滑：带主题的进度条往前走时用定时器做动画，而原程序下载时不跑消息循环，动画走不动，
+    进度条会滞后再一下跳过去。每次设置位置后先设到“位置+1”再设回（往回设不做动画、立即到位；
+    100% 时临时把范围扩到 101），再 UpdateWindow 立即重画。
+16. 打开一次只升级一次：升级成功后 (G_UI = 2) auto_ready 一直返回 0，之后的断开/接入既不
+    再触发升级，也不改界面（保持满格和“升级成功”），直到关闭程序。失败不算，可以重试。
    程序图标换成 upgrader/upgrader_icon.ico（资源目录整体重建到新增的 .rsrc 节，原节改名 .oldrsrc，
    用的是 upgrader/make_upgrader.py 里的 set_icon，生成升级程序时还可以再换）。
 10. 升级成功后自动退出（配置区选项 CFG_AUTO_EXIT）：“下载程序”流程里跳转 APP 成功
@@ -308,9 +313,13 @@ recently_done:
 %if UPGRADER
 ; ---- eax != 0: 已内置固件 ----
 auto_ready:
+    xor     eax, eax
+    cmp     byte [G_UI], 2              ; 这次运行已经升级成功过 -> 不再升级
+    je      .r
     mov     eax, [fw_len]
     neg     eax
     sbb     eax, eax
+.r:
     ret
 
 ; ---- 载入内置固件：调用“打开文件”处理函数 (esi = this) ----
@@ -648,12 +657,11 @@ hook_disc:
     ret     4
 
 ; ---- 设备断开：进度条清零，标签显示“请插入你的键盘” ----
-; G_UI: 0 平时, 1 显示着“请插入你的键盘”, 2 刚升级成功, 3 刚升级成功且设备已跳回 APP 断开过一次
+; G_UI: 0 平时, 1 显示着“请插入你的键盘”, 2 已升级成功（本次运行不再变化）
 ui_disconnected:
     cmp     byte [G_UI], 2
     jne     .hint
-    mov     byte [G_UI], 3              ; 升级成功后跳回 APP 的断开，保留“升级成功”
-    ret
+    ret                                 ; 已升级成功：保持满格和“升级成功”
 .hint:
     call    clear_fail
     mov     byte [G_UI], 1
@@ -675,6 +683,8 @@ ui_disconnected:
 
 ; ---- 设备接入：如果正显示“请插入你的键盘”，换回 0% ----
 ui_connected:
+    cmp     byte [G_UI], 2              ; 已升级成功：不改界面
+    je      .r
     call    clear_fail
     mov     al, [G_UI]
     mov     byte [G_UI], 0
@@ -731,11 +741,62 @@ hook_setpos:
     push    eax
     cmp     dword [esp + 12], 0x402     ; PBM_SETPOS
     jne     .ret
-    mov     eax, [esp + 16]             ; 位置 0~100
+    mov     eax, [esp + 8]              ; 进度条
+    mov     ecx, [esp + 16]             ; 位置 0~100
+    call    bar_snap
+    mov     eax, [esp + 16]
     call    show_percent
 .ret:
     pop     eax
     ret     16
+
+; ---- eax = 进度条, ecx = 位置：跳过主题动画，立即画到这个位置 ----
+bar_snap:
+    push    esi
+    push    edi
+    mov     esi, eax
+    mov     edi, ecx
+    cmp     edi, 100
+    jb      .lt
+    push    101                         ; 100%: 范围临时扩到 0~101
+    push    0
+    push    0x406                       ; PBM_SETRANGE32
+    push    esi
+    call    [IAT_SendMessageW]
+    push    0
+    push    101
+    push    0x402
+    push    esi
+    call    [IAT_SendMessageW]
+    push    0
+    push    100
+    push    0x402
+    push    esi
+    call    [IAT_SendMessageW]
+    push    100
+    push    0
+    push    0x406
+    push    esi
+    call    [IAT_SendMessageW]
+    jmp     .upd
+.lt:
+    lea     eax, [edi + 1]
+    push    0
+    push    eax
+    push    0x402                       ; 先设到 位置+1
+    push    esi
+    call    [IAT_SendMessageW]
+    push    0
+    push    edi
+    push    0x402                       ; 再设回：往回设没有动画，立即到位
+    push    esi
+    call    [IAT_SendMessageW]
+.upd:
+    push    esi
+    call    [IAT_UpdateWindow]
+    pop     edi
+    pop     esi
+    ret
 
 ; ---- 替换 0x4039AE 处校验开始时的“进度清零”：进入校验阶段 ----
 hook_verify_start:
